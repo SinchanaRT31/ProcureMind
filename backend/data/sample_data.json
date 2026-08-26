@@ -1,0 +1,246 @@
+{
+  "summary": {
+    "total_transactions": 18426,
+    "total_anomalies": 247,
+    "high_risk_vendors": 16,
+    "potential_savings": 182000,
+    "transactions_delta": "+8.4% this month",
+    "anomalies_delta": "31 need review today",
+    "vendors_delta": "5 escalated this week",
+    "savings_delta": "Recovered or prevented"
+  },
+  "alerts": {
+    "last_24_hours": 12,
+    "headline": "Invoice cluster from ABC Suppliers is 4.2x above historical average.",
+    "highest_risk_score": 91
+  },
+  "risk_trend": [
+    {
+      "day": "Mon",
+      "score": 36
+    },
+    {
+      "day": "Tue",
+      "score": 48
+    },
+    {
+      "day": "Wed",
+      "score": 44
+    },
+    {
+      "day": "Thu",
+      "score": 68
+    },
+    {
+      "day": "Fri",
+      "score": 59
+    },
+    {
+      "day": "Sat",
+      "score": 77
+    },
+    {
+      "day": "Sun",
+      "score": 91
+    }
+  ],
+  "workflow": [
+    "Data management and validation",
+    "AI anomaly detection",
+    "Vendor and invoice risk analysis",
+    "SHAP explanation and alerting",
+    "Human investigation and feedback"
+  ],
+  "transactions": [
+    {
+      "id": "tx-2048",
+      "invoice": "INV-2048",
+      "vendor": "ABC Suppliers",
+      "department": "Facilities",
+      "date": "2026-08-22",
+      "amount": 87500,
+      "risk": 91,
+      "level": "high",
+      "status": "Under Investigation",
+      "type": "Invoice",
+      "reason": "4.2x spend deviation and near-duplicate invoice pattern",
+      "explanation": {
+        "summary": "Risk is driven by a sharp spend deviation, duplicate invoice similarity, and a sudden increase in vendor transaction frequency.",
+        "factors": [
+          {
+            "label": "Transaction amount",
+            "weight": "High contribution"
+          },
+          {
+            "label": "Vendor deviation",
+            "weight": "High contribution"
+          },
+          {
+            "label": "Department spending",
+            "weight": "Medium contribution"
+          },
+          {
+            "label": "Invoice similarity",
+            "weight": "Medium contribution"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tx-1988",
+      "invoice": "INV-1988",
+      "vendor": "Northstar Office",
+      "department": "IT",
+      "date": "2026-08-21",
+      "amount": 24260,
+      "risk": 82,
+      "level": "high",
+      "status": "Confirmed",
+      "type": "Invoice",
+      "reason": "Unusual frequency spike from same vendor",
+      "explanation": {
+        "summary": "Transaction frequency jumped 2.1x over the vendor baseline with repeated procurement values in a narrow date window.",
+        "factors": [
+          {
+            "label": "Transaction frequency",
+            "weight": "High contribution"
+          },
+          {
+            "label": "Amount clustering",
+            "weight": "Medium contribution"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tx-1931",
+      "invoice": "INV-1931",
+      "vendor": "Metro Industrial",
+      "department": "Operations",
+      "date": "2026-08-20",
+      "amount": 11480,
+      "risk": 66,
+      "level": "medium",
+      "status": "Review Pending",
+      "type": "Purchase Order",
+      "reason": "Price variance against historical baseline",
+      "explanation": {
+        "summary": "The purchase amount is elevated compared with prior department and vendor combinations for the same category.",
+        "factors": [
+          {
+            "label": "Price deviation",
+            "weight": "High contribution"
+          },
+          {
+            "label": "Department baseline",
+            "weight": "Medium contribution"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tx-1902",
+      "invoice": "INV-1902",
+      "vendor": "Helix Logistics",
+      "department": "Procurement",
+      "date": "2026-08-18",
+      "amount": 6940,
+      "risk": 33,
+      "level": "low",
+      "status": "False Positive",
+      "type": "Invoice",
+      "reason": "Temporary department demand spike explained by project load",
+      "explanation": {
+        "summary": "The alert was explained by a short-lived demand surge linked to an approved operations project.",
+        "factors": [
+          {
+            "label": "Department spending",
+            "weight": "Low contribution"
+          },
+          {
+            "label": "Vendor history",
+            "weight": "Low contribution"
+          }
+        ]
+      }
+    }
+  ],
+  "vendors": [
+    {
+      "id": "vendor-abc",
+      "name": "ABC Suppliers",
+      "score": 87,
+      "level": "High Risk",
+      "anomalies": 9,
+      "duplicate_invoices": 3,
+      "price_deviation": "18.2%",
+      "note": "Duplicate invoices, price deviations, and unusual purchasing behavior."
+    },
+    {
+      "id": "vendor-northstar",
+      "name": "Northstar Office",
+      "score": 74,
+      "level": "Medium Risk",
+      "anomalies": 5,
+      "duplicate_invoices": 1,
+      "price_deviation": "9.4%",
+      "note": "Transaction frequency increased 2.1x over 30-day average."
+    },
+    {
+      "id": "vendor-helix",
+      "name": "Helix Logistics",
+      "score": 29,
+      "level": "Low Risk",
+      "anomalies": 1,
+      "duplicate_invoices": 0,
+      "price_deviation": "1.1%",
+      "note": "Recent anomalies were resolved as operational exceptions."
+    }
+  ],
+  "duplicates": [
+    {
+      "id": "dup-2048-2026",
+      "primary_invoice": "INV-2048",
+      "related_invoice": "INV-2026",
+      "vendor": "ABC Suppliers",
+      "similarity": 96,
+      "days_apart": 3,
+      "note": "Same vendor, similar amount, repeated line-item pattern."
+    },
+    {
+      "id": "dup-1910-1904",
+      "primary_invoice": "INV-1910",
+      "related_invoice": "INV-1904",
+      "vendor": "Northstar Office",
+      "similarity": 100,
+      "days_apart": 0,
+      "note": "Invoice ID reused with same total and same cost center."
+    }
+  ],
+  "cases": [
+    {
+      "id": "PM-118",
+      "transaction_id": "tx-2048",
+      "owner": "Priya N.",
+      "status": "Under Investigation",
+      "priority": "High",
+      "notes": "Waiting on vendor clarification and contract cross-check."
+    },
+    {
+      "id": "PM-116",
+      "transaction_id": "tx-1988",
+      "owner": "Aman S.",
+      "status": "Confirmed",
+      "priority": "High",
+      "notes": "Duplicate invoice validated and payment hold applied."
+    },
+    {
+      "id": "PM-109",
+      "transaction_id": "tx-1902",
+      "owner": "Riya K.",
+      "status": "False Positive",
+      "priority": "Low",
+      "notes": "Seasonal procurement spike documented and approved."
+    }
+  ]
+}

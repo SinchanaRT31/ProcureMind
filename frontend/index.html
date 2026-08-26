@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ProcureMind</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">PM</div>
+          <div>
+            <h1>ProcureMind</h1>
+            <p>Procurement anomaly workspace</p>
+          </div>
+        </div>
+
+        <nav class="nav">
+          <a class="nav-link active" href="#dashboard">Dashboard</a>
+          <a class="nav-link" href="#transactions-panel">Transactions</a>
+          <a class="nav-link" href="#vendors-panel">Vendors</a>
+          <a class="nav-link" href="#duplicates-panel">Duplicates</a>
+          <a class="nav-link" href="#cases-panel">Cases</a>
+        </nav>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar" id="dashboard">
+          <div>
+            <h2>Risk monitoring dashboard</h2>
+            <p id="topbar-alert">Loading alert summary...</p>
+          </div>
+          <div class="topbar-actions">
+            <button class="button secondary">Export</button>
+            <button class="button primary">Upload Data</button>
+          </div>
+        </header>
+
+        <section class="stats-grid" id="stats-grid"></section>
+
+        <section class="content-grid">
+          <article class="card card-wide">
+            <div class="card-head">
+              <div>
+                <h3>Weekly risk trend</h3>
+                <p>Anomaly pressure across recent procurement activity</p>
+              </div>
+            </div>
+            <div id="risk-trend" class="trend-chart"></div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <div>
+                <h3>Workflow</h3>
+                <p>Core review lifecycle</p>
+              </div>
+            </div>
+            <ul id="workflow-list" class="simple-list"></ul>
+          </article>
+        </section>
+
+        <section class="card" id="transactions-panel">
+          <div class="card-head">
+            <div>
+              <h3>Transactions</h3>
+              <p>Filtered procurement activity and flagged risk signals</p>
+            </div>
+          </div>
+
+          <form id="filters-form" class="filters">
+            <input name="vendor" type="text" placeholder="Vendor" />
+            <input name="department" type="text" placeholder="Department" />
+            <select name="risk_level">
+              <option value="">All risk levels</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+            <select name="status">
+              <option value="">All statuses</option>
+              <option value="Under Investigation">Under Investigation</option>
+              <option value="Confirmed">Confirmed</option>
+              <option value="Review Pending">Review Pending</option>
+              <option value="False Positive">False Positive</option>
+            </select>
+            <select name="type">
+              <option value="">All types</option>
+              <option value="Invoice">Invoice</option>
+              <option value="Purchase Order">Purchase Order</option>
+            </select>
+            <button class="button secondary" type="submit">Apply Filters</button>
+          </form>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Invoice</th>
+                  <th>Vendor</th>
+                  <th>Department</th>
+                  <th>Date</th>
+                  <th>Amount</th>
+                  <th>Risk</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="transactions-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="content-grid">
+          <article class="card" id="vendors-panel">
+            <div class="card-head">
+              <div>
+                <h3>Vendor risk scoring</h3>
+                <p>Dynamic profile based on anomalies and spend behaviour</p>
+              </div>
+            </div>
+            <div id="vendors-list" class="stack"></div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <div>
+                <h3>Explainability</h3>
+                <p>Why the highest-risk transaction was flagged</p>
+              </div>
+            </div>
+            <div id="highlight-panel" class="highlight-panel"></div>
+          </article>
+        </section>
+
+        <section class="content-grid">
+          <article class="card" id="duplicates-panel">
+            <div class="card-head">
+              <div>
+                <h3>Duplicate and near-duplicate invoices</h3>
+                <p>Similarity review queue</p>
+              </div>
+            </div>
+            <div id="duplicates-list" class="stack"></div>
+          </article>
+
+          <article class="card" id="cases-panel">
+            <div class="card-head">
+              <div>
+                <h3>Case management</h3>
+                <p>Update investigation status and notes</p>
+              </div>
+            </div>
+            <div id="cases-list" class="stack"></div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+  </html>

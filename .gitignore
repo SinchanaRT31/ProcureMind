@@ -1,0 +1,33 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Environment variables / secrets
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Large/generated datasets
+*.csv
+*.parquet
+
+# Model artifacts
+*.pkl
+*.joblib
+*.h5
+*.keras
+
+# Logs
+*.log
