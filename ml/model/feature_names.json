@@ -1,0 +1,20 @@
+[
+  "vendor_rating",
+  "quantity",
+  "unit_price",
+  "total_amount",
+  "vendor_historical_avg",
+  "department_historical_avg",
+  "vendor_transaction_frequency",
+  "vendor_price_deviation",
+  "amount_vs_vendor_average",
+  "invoice_delay_days",
+  "payment_due_days",
+  "order_month",
+  "order_day_of_week",
+  "is_weekend",
+  "amount_vs_department_average",
+  "quantity_vs_expected",
+  "unit_price_vs_expected",
+  "vendor_frequency_percentile"
+]

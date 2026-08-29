@@ -31,3 +31,12 @@ __pycache__/
 
 # Logs
 *.log
+
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+
+ml/model/isolation_forest.pkl
+ml/model/predictions.csv
