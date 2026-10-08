@@ -4,6 +4,7 @@ venv/
 env/
 __pycache__/
 *.py[cod]
+*.pyc
 
 # Environment variables / secrets
 .env
@@ -19,24 +20,17 @@ __pycache__/
 .vscode/
 .idea/
 
-# Large/generated datasets
-*.csv
-*.parquet
-
-# Model artifacts
-*.pkl
-*.joblib
-*.h5
-*.keras
-
 # Logs
 *.log
 
-.venv/
-__pycache__/
-*.pyc
-.env
-.DS_Store
-
-ml/model/isolation_forest.pkl
-ml/model/predictions.csv
+# Generated ML artifacts
+ml/model/*.pkl
+ml/model/predictions*.csv
+ml/model/test_*.csv
+ml/model/evaluation_metrics.json
+ml/model/evidence_evaluation.json
+ml/model/risk_evaluation.json
+ml/model/split_metadata.json
+ml/model/temporal_cadence_experiment.json
+ml/model/verification_evaluation.json
+ml/model/feature_names.json

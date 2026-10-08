@@ -5,210 +5,116 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-
+from sklearn.base import BaseEstimator, TransformerMixin
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATASET_PATH = (
-    REPO_ROOT / "dataset" / "ProcureMind" / "procuremind_procurement_dataset.csv"
-)
-
+DEFAULT_DATASET_PATH = REPO_ROOT / "dataset" / "ProcureMind" / "procuremind_procurement_dataset.csv"
 DATE_COLUMNS = ["order_date", "invoice_date", "due_date"]
 TARGET_COLUMN = "is_anomaly"
 TRANSACTION_ID_COLUMN = "transaction_id"
-
-REQUIRED_COLUMNS = [
-    "transaction_id",
-    "vendor_id",
-    "vendor_rating",
-    "department_id",
-    "item_category",
-    "quantity",
-    "unit_price",
-    "total_amount",
-    "order_date",
-    "invoice_date",
-    "due_date",
-    "is_anomaly",
-    "vendor_historical_avg",
-    "department_historical_avg",
-    "vendor_transaction_frequency",
-    "vendor_price_deviation",
-    "amount_vs_vendor_average",
+REQUIRED_RAW_COLUMNS = [
+    "transaction_id", "vendor_id", "vendor_rating", "department_id", "item_category",
+    "quantity", "unit_price", "total_amount", "order_date", "invoice_date", "due_date",
+    "payment_status", "purchase_type", "vendor_location",
 ]
-
-POSITIVE_NUMERIC_COLUMNS = [
-    "quantity",
-    "unit_price",
-    "total_amount",
-    "vendor_historical_avg",
-    "department_historical_avg",
-    "vendor_transaction_frequency",
-]
-
-FEATURE_COLUMNS = [
-    "vendor_rating",
-    "quantity",
-    "unit_price",
-    "total_amount",
-    "vendor_historical_avg",
-    "department_historical_avg",
-    "vendor_transaction_frequency",
-    "vendor_price_deviation",
-    "amount_vs_vendor_average",
-    "invoice_delay_days",
-    "payment_due_days",
-    "order_month",
-    "order_day_of_week",
-    "is_weekend",
-    "amount_vs_department_average",
-    "quantity_vs_expected",
-    "unit_price_vs_expected",
-    "vendor_frequency_percentile",
-]
+NUMERIC_COLUMNS = ["vendor_rating", "quantity", "unit_price", "total_amount"]
+POSITIVE_NUMERIC_COLUMNS = ["quantity", "unit_price", "total_amount"]
+FREQUENCY_COLUMNS = ["vendor_id", "department_id", "item_category", "purchase_type", "payment_status", "vendor_location"]
 
 
 def load_data(dataset_path: str | Path = DEFAULT_DATASET_PATH) -> pd.DataFrame:
-    """Load the procurement dataset from disk."""
-    path = Path(dataset_path)
-    return pd.read_csv(path)
+    return pd.read_csv(Path(dataset_path))
 
 
 def _validate_columns(df: pd.DataFrame, required_columns: Iterable[str]) -> None:
-    missing_columns = sorted(set(required_columns) - set(df.columns))
-    if missing_columns:
-        raise ValueError(f"Dataset is missing required columns: {missing_columns}")
+    missing = sorted(set(required_columns) - set(df.columns))
+    if missing:
+        raise ValueError(f"Dataset is missing required columns: {missing}")
 
 
-def _safe_ratio(
-    numerator: pd.Series, denominator: pd.Series, default: float = np.nan
-) -> pd.Series:
-    denominator = denominator.replace(0, np.nan)
-    ratio = numerator.div(denominator)
-    return ratio.replace([np.inf, -np.inf], default)
+def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    return numerator.div(denominator.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
 
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Parse dates, coerce numeric types, and sanitize invalid values."""
-    _validate_columns(df, REQUIRED_COLUMNS)
-
+def clean_data(df: pd.DataFrame, *, require_target: bool = False) -> pd.DataFrame:
+    """Normalize raw values without calculating any learned statistics."""
+    _validate_columns(df, REQUIRED_RAW_COLUMNS + ([TARGET_COLUMN] if require_target else []))
     cleaned = df.copy()
-
     for column in DATE_COLUMNS:
         cleaned[column] = pd.to_datetime(cleaned[column], errors="coerce")
-
-    numeric_columns = [
-        "vendor_rating",
-        "quantity",
-        "unit_price",
-        "total_amount",
-        "vendor_historical_avg",
-        "department_historical_avg",
-        "vendor_transaction_frequency",
-        "vendor_price_deviation",
-        "amount_vs_vendor_average",
-        TARGET_COLUMN,
-    ]
-    for column in numeric_columns:
+    for column in NUMERIC_COLUMNS:
         cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce")
-
-    cleaned["vendor_rating"] = cleaned["vendor_rating"].where(
-        cleaned["vendor_rating"].between(1, 5), np.nan
-    )
-
+    cleaned["vendor_rating"] = cleaned["vendor_rating"].where(cleaned["vendor_rating"].between(1, 5), np.nan)
     for column in POSITIVE_NUMERIC_COLUMNS:
         cleaned[column] = cleaned[column].where(cleaned[column] > 0, np.nan)
-
-    cleaned["amount_vs_vendor_average"] = cleaned["amount_vs_vendor_average"].where(
-        cleaned["amount_vs_vendor_average"] >= 0, np.nan
-    )
-    cleaned[TARGET_COLUMN] = cleaned[TARGET_COLUMN].fillna(0).astype(int)
-
+    if TARGET_COLUMN in cleaned:
+        cleaned[TARGET_COLUMN] = pd.to_numeric(cleaned[TARGET_COLUMN], errors="coerce").fillna(0).astype(int)
     return cleaned
 
 
-def create_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Build Isolation Forest features without using label or risk outputs."""
-    features = pd.DataFrame(index=df.index)
+class ProcurementFeatureTransformer(BaseEstimator, TransformerMixin):
+    """Feature builder whose baselines, frequencies, and imputations are train-fitted."""
 
-    for column in FEATURE_COLUMNS[:9]:
-        features[column] = df[column]
+    def fit(self, X: pd.DataFrame, y: object = None) -> "ProcurementFeatureTransformer":
+        df = clean_data(X)
+        self.global_medians_ = {
+            column: float(df[column].median()) if pd.notna(df[column].median()) else 1.0
+            for column in POSITIVE_NUMERIC_COLUMNS
+        }
+        self.vendor_amount_median_ = df.groupby("vendor_id")["total_amount"].median()
+        self.department_amount_median_ = df.groupby("department_id")["total_amount"].median()
+        self.category_quantity_median_ = df.groupby("item_category")["quantity"].median()
+        self.category_price_median_ = df.groupby("item_category")["unit_price"].median()
+        self.vendor_category_quantity_median_ = df.groupby(["vendor_id", "item_category"])["quantity"].median()
+        self.vendor_category_price_median_ = df.groupby(["vendor_id", "item_category"])["unit_price"].median()
+        self.frequency_maps_ = {
+            column: df[column].fillna("__MISSING__").astype(str).value_counts().div(len(df))
+            for column in FREQUENCY_COLUMNS
+        }
+        self.feature_names_ = [
+            "vendor_rating", "quantity", "unit_price", "total_amount", "invoice_delay_days",
+            "payment_due_days", "order_month", "order_day_of_week", "is_weekend",
+            "amount_vs_vendor_baseline", "amount_vs_department_baseline",
+            "quantity_vs_vendor_category_baseline", "unit_price_vs_vendor_category_baseline",
+            *[f"{column}_frequency" for column in FREQUENCY_COLUMNS],
+        ]
+        provisional = self._build_features(df)
+        self.imputation_values_ = {
+            column: float(provisional[column].median()) if pd.notna(provisional[column].median()) else 0.0
+            for column in self.feature_names_
+        }
+        return self
 
-    features["invoice_delay_days"] = (
-        df["invoice_date"] - df["order_date"]
-    ).dt.days.astype("float64")
-    features["payment_due_days"] = (
-        df["due_date"] - df["invoice_date"]
-    ).dt.days.astype("float64")
-    features["order_month"] = df["order_date"].dt.month.astype("float64")
-    features["order_day_of_week"] = df["order_date"].dt.dayofweek.astype("float64")
-    features["is_weekend"] = (df["order_date"].dt.dayofweek >= 5).astype("float64")
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        if not hasattr(self, "imputation_values_"):
+            raise ValueError("ProcurementFeatureTransformer must be fitted before transform.")
+        return self._build_features(clean_data(X)).loc[:, self.feature_names_].fillna(self.imputation_values_).astype(float)
 
-    features["amount_vs_department_average"] = _safe_ratio(
-        df["total_amount"], df["department_historical_avg"]
-    )
-
-    quantity_expected = (
-        df.groupby(["vendor_id", "item_category"])["quantity"].transform("median")
-    )
-    quantity_expected = quantity_expected.fillna(
-        df.groupby("item_category")["quantity"].transform("median")
-    )
-    quantity_expected = quantity_expected.fillna(df["quantity"].median())
-    features["quantity_vs_expected"] = _safe_ratio(df["quantity"], quantity_expected)
-
-    unit_price_expected = (
-        df.groupby(["vendor_id", "item_category"])["unit_price"].transform("median")
-    )
-    unit_price_expected = unit_price_expected.fillna(
-        df.groupby("item_category")["unit_price"].transform("median")
-    )
-    unit_price_expected = unit_price_expected.fillna(df["unit_price"].median())
-    features["unit_price_vs_expected"] = _safe_ratio(
-        df["unit_price"], unit_price_expected
-    )
-
-    vendor_frequency_by_vendor = df.groupby("vendor_id")[
-        "vendor_transaction_frequency"
-    ].median()
-    vendor_frequency_percentiles = vendor_frequency_by_vendor.rank(
-        method="average", pct=True
-    )
-    features["vendor_frequency_percentile"] = df["vendor_id"].map(
-        vendor_frequency_percentiles
-    )
-
-    features = features.replace([np.inf, -np.inf], np.nan)
-    features = features.apply(pd.to_numeric, errors="coerce")
-    features = features[FEATURE_COLUMNS]
-
-    median_values = features.median(numeric_only=True)
-    features = features.fillna(median_values)
-
-    return features
-
-
-def preprocess_data(
-    dataset_path: str | Path = DEFAULT_DATASET_PATH,
-) -> tuple[pd.DataFrame, pd.Series, pd.Series, list[str]]:
-    """Return feature matrix, transaction ids, evaluation labels, and feature names."""
-    raw_df = load_data(dataset_path)
-    cleaned_df = clean_data(raw_df)
-    X = create_features(cleaned_df)
-    transaction_ids = cleaned_df[TRANSACTION_ID_COLUMN].astype(str)
-    y = cleaned_df[TARGET_COLUMN].copy()
-    feature_names = X.columns.tolist()
-    return X, transaction_ids, y, feature_names
+    def _build_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        features = pd.DataFrame(index=df.index)
+        for column in ["vendor_rating", "quantity", "unit_price", "total_amount"]:
+            features[column] = df[column]
+        features["invoice_delay_days"] = (df["invoice_date"] - df["order_date"]).dt.days
+        features["payment_due_days"] = (df["due_date"] - df["invoice_date"]).dt.days
+        features["order_month"] = df["order_date"].dt.month
+        features["order_day_of_week"] = df["order_date"].dt.dayofweek
+        features["is_weekend"] = (df["order_date"].dt.dayofweek >= 5).astype(float)
+        vendor_amount = df["vendor_id"].map(self.vendor_amount_median_).fillna(self.global_medians_["total_amount"])
+        department_amount = df["department_id"].map(self.department_amount_median_).fillna(self.global_medians_["total_amount"])
+        keys = pd.MultiIndex.from_frame(df[["vendor_id", "item_category"]])
+        quantity_baseline = pd.Series(self.vendor_category_quantity_median_.reindex(keys).to_numpy(), index=df.index)
+        price_baseline = pd.Series(self.vendor_category_price_median_.reindex(keys).to_numpy(), index=df.index)
+        quantity_baseline = quantity_baseline.fillna(df["item_category"].map(self.category_quantity_median_)).fillna(self.global_medians_["quantity"])
+        price_baseline = price_baseline.fillna(df["item_category"].map(self.category_price_median_)).fillna(self.global_medians_["unit_price"])
+        features["amount_vs_vendor_baseline"] = _safe_ratio(df["total_amount"], vendor_amount)
+        features["amount_vs_department_baseline"] = _safe_ratio(df["total_amount"], department_amount)
+        features["quantity_vs_vendor_category_baseline"] = _safe_ratio(df["quantity"], quantity_baseline)
+        features["unit_price_vs_vendor_category_baseline"] = _safe_ratio(df["unit_price"], price_baseline)
+        for column in FREQUENCY_COLUMNS:
+            features[f"{column}_frequency"] = df[column].fillna("__MISSING__").astype(str).map(self.frequency_maps_[column]).fillna(0.0)
+        return features.replace([np.inf, -np.inf], np.nan)
 
 
-if __name__ == "__main__":
-    X, transaction_ids, y, feature_names = preprocess_data()
-
-    print(f"Dataset shape: {X.shape}")
-    print(f"Number of rows: {len(X)}")
-    print(f"Number of generated features: {len(feature_names)}")
-    print(f"Feature names: {feature_names}")
-    print("Missing values after preprocessing:")
-    print(X.isna().sum().to_string())
-    print("First 5 rows of X:")
-    print(X.head().to_string())
-    print(f"Number of anomaly labels in y: {int(y.sum())}")
+def preprocess_data(dataset_path: str | Path = DEFAULT_DATASET_PATH) -> pd.DataFrame:
+    """Load cleaned raw data; callers must split before fitting a transformer."""
+    return clean_data(load_data(dataset_path), require_target=True)
