@@ -13,8 +13,9 @@ ProcureMind is an enterprise procurement anomaly-detection project. The current 
 - A deterministic investigation-priority layer that compresses correlated signals into PRICE, SPEND, QUANTITY, and TIMING families. It returns LOW/MEDIUM/HIGH/CRITICAL review priorities and recommended actions; it is a triage heuristic, not an autonomous fraud decision.
 - Deterministic document verification: potential duplicate candidates based on exact business metadata and close invoice dates, plus date/arithmetic consistency checks. A separate chronological vendor-cadence experiment is reported independently from the random-split benchmark.
 - A vanilla HTML/CSS/JavaScript dashboard served by a Python standard-library HTTP server. It uses sample dashboard data and is not yet connected to ML output.
+- An optional SHAP explainability layer that attributes the exact Isolation Forest anomaly score without altering predictions, evidence, or risk logic.
 
-The project does not currently implement FastAPI, MongoDB, SHAP, an LLM investigator, or a production database.
+The project does not currently implement FastAPI, MongoDB, an LLM investigator, or a production database.
 
 ## Run the ML baseline
 
@@ -23,6 +24,7 @@ python ml/train.py
 ```
 
 Generated, ignored artifacts in `ml/model/` include the model, fitted transformer, feature order, held-out metrics, split metadata, and test predictions. Label and downstream outcome fields—including `risk_score`, `risk_level`, `investigation_status`, and `potential_savings`—are never model inputs.
+Training also saves `shap_background_features.pkl`: a deterministic sample of up to 50 transformed training rows, without labels or outcome fields. Explanations require this artifact; they fail clearly if it is absent rather than using prediction rows as a reference.
 
 The evidence engine derives moderate/high thresholds from the training partition's 95th/99th percentiles of each deviation measure. Amount-tail alerts use a training-derived department/category empirical percentile with a global fallback. Vendor frequency, vendor rating, department, item category, purchase type, payment status, and vendor location are contextual information only and do not independently create an anomaly alert.
 
@@ -38,7 +40,23 @@ Append evidence and investigation-priority output without changing the default C
 python ml/predict.py path/to/raw_procurement.csv --include-risk
 ```
 
-Input data must contain the raw fields required by `ml.preprocess`; it does not need labels or outcome columns.
+Append SHAP feature-contribution summaries without changing the default CLI result. Explanations are opt-in, use batches of 10 rows by default, and process every requested row; runtime grows with the number of rows and features:
+
+```bash
+python ml/predict.py path/to/raw_procurement.csv --include-explanations
+```
+
+The exact explained function is `f(X) = -model.score_samples(X)`, the same anomaly score returned as `ml_anomaly_score`; higher scores mean stronger model anomaly signals. Permutation SHAP uses the saved training-only background as its baseline. A positive contribution raises the score relative to that baseline, and a negative contribution lowers it. The code checks that baseline plus contributions reconstructs the score within absolute tolerance `1e-6` (and relative tolerance `1e-6`).
+
+Use `--explanation-batch-size N` to change rows evaluated per SHAP call. Batching controls working memory, not total computation: do not request explanations for very large files without allowing for longer runtimes. The standalone command accepts the same `--batch-size` option.
+
+Or generate the explanation table directly:
+
+```bash
+python ml/explain.py path/to/raw_procurement.csv --top-k 5
+```
+
+Input data must contain the raw fields required by `ml.preprocess`; it does not need labels or outcome columns. SHAP attributes this model score only; it is separate from behavioral evidence, document verification, and investigation priority. Contributions describe how the model score changes relative to the selected background, not fraud, intent, causality, or vendor wrongdoing. Permutation SHAP estimates feature attributions, and its result depends on the training reference sample and feature dependence assumptions.
 
 The risk layer uses ML-score 95th/99th training percentiles for normal/elevated/high ML context. A single strongest signal per evidence family contributes to priority, preventing three correlated price deviations from being counted as three independent reasons. One moderate family or ML-only indication is MEDIUM; a high family or multiple families is HIGH; two high independent families is CRITICAL.
 

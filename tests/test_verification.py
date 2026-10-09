@@ -3,7 +3,8 @@ import json
 import pandas as pd
 
 from ml.verification import ProcurementVerificationEngine, temporal_vendor_cadence_experiment
-from tests.test_preprocess import raw_frame
+from test_preprocess import raw_frame
+
 
 
 def duplicated_frame() -> pd.DataFrame:

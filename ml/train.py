@@ -25,6 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIR = REPO_ROOT / "ml" / "model"
 MODEL_PATH = MODEL_DIR / "isolation_forest.pkl"
 TRANSFORMER_PATH = MODEL_DIR / "procurement_feature_transformer.pkl"
+EXPLANATION_BACKGROUND_PATH = MODEL_DIR / "shap_background_features.pkl"
 FEATURE_NAMES_PATH = MODEL_DIR / "feature_names.json"
 PREDICTIONS_PATH = MODEL_DIR / "test_predictions.csv"
 METRICS_PATH = MODEL_DIR / "evaluation_metrics.json"
@@ -93,6 +94,9 @@ def main() -> None:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, MODEL_PATH)
     joblib.dump(transformer, TRANSFORMER_PATH)
+    # Small, deterministic, outcome-free reference set for model explanations.
+    background = X_train.sample(n=min(50, len(X_train)), random_state=RANDOM_STATE)
+    joblib.dump(background.loc[:, transformer.feature_names_], EXPLANATION_BACKGROUND_PATH)
     joblib.dump(evidence_engine, EVIDENCE_ENGINE_PATH)
     joblib.dump(risk_engine, RISK_ENGINE_PATH)
     joblib.dump(verification_engine, VERIFICATION_ENGINE_PATH)

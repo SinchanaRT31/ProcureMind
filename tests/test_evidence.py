@@ -1,7 +1,7 @@
 import json
 
 from ml.evidence import ProcurementEvidenceEngine
-from tests.test_preprocess import raw_frame
+from test_preprocess import raw_frame
 
 
 def training_frame():

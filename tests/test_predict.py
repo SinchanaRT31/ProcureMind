@@ -5,7 +5,8 @@ from sklearn.ensemble import IsolationForest
 
 from ml.predict import predict_procurement_data
 from ml.preprocess import ProcurementFeatureTransformer
-from tests.test_preprocess import raw_frame
+from test_preprocess import raw_frame
+
 
 
 def test_prediction_loads_matching_model_and_transformer(tmp_path: Path):

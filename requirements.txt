@@ -416,3 +416,4 @@ zict @ file:///Users/builder/cbouss/perseverance-python-buildout/croot/zict_1728
 zipp @ file:///opt/miniconda3/conda-bld/zipp_1763977858517/work
 zope.interface @ file:///opt/miniconda3/conda-bld/zope.interface_1762336927613/work
 zstandard @ file:///opt/miniconda3/conda-bld/zstandard_1758189078532/work
+shap==0.52.0
