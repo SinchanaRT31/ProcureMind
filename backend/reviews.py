@@ -8,7 +8,7 @@ import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 PROCESS_LOCK = threading.RLock()
@@ -74,6 +74,40 @@ class InvestigationStore:
             return self._copy(case)
 
     def open_case(self, transaction_id: str, reviewer_id: str | None = None) -> tuple[dict[str, Any], bool]:
+        return self._open_case(transaction_id, reviewer_id)
+
+    def open_trusted_case(
+        self,
+        transaction_id: str,
+        reviewer_id: str | None = None,
+        *,
+        trusted_lookup: Callable[[str], Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Open a case only after the trusted source confirms one exact row."""
+        transaction_id = _optional_text(transaction_id, "transaction_id", maximum=200)
+        if transaction_id is None:
+            raise ReviewValidationError("transaction_id is required.")
+        reviewer_id = _optional_text(reviewer_id, "reviewer_id")
+        # Return an existing active case idempotently, even if the trusted source
+        # becomes unavailable after the original case was opened.
+        with PROCESS_LOCK:
+            cases = self._load_cases()
+            active = next(
+                (case for case in cases if case["transaction_id"] == transaction_id and case["review_status"] != "RESOLVED"),
+                None,
+            )
+            if active is not None:
+                return self._copy(active), False
+        trusted_lookup(transaction_id)
+        return self._open_case(transaction_id, reviewer_id, allow_unlisted_transaction=True)
+
+    def _open_case(
+        self,
+        transaction_id: str,
+        reviewer_id: str | None = None,
+        *,
+        allow_unlisted_transaction: bool = False,
+    ) -> tuple[dict[str, Any], bool]:
         transaction_id = _optional_text(transaction_id, "transaction_id", maximum=200)
         if transaction_id is None:
             raise ReviewValidationError("transaction_id is required.")
@@ -85,7 +119,7 @@ class InvestigationStore:
             if not isinstance(transactions, list) or any(not isinstance(item, dict) for item in transactions):
                 raise ReviewStoreError("Sample data does not contain a valid transactions list.")
             known_transactions = {str(item.get("id")) for item in transactions if item.get("id") is not None}
-            if transaction_id not in known_transactions:
+            if transaction_id not in known_transactions and not allow_unlisted_transaction:
                 raise ReviewNotFoundError(f"Transaction '{transaction_id}' was not found.")
             active = next(
                 (case for case in cases if case["transaction_id"] == transaction_id and case["review_status"] != "RESOLVED"),

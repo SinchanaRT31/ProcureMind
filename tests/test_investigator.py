@@ -106,9 +106,13 @@ def report_api(tmp_path, monkeypatch):
     thread.join(timeout=3)
 
 
-def request(base: str, path: str) -> tuple[int, dict]:
+def request(base: str, path: str, *, method: str = "GET", body: dict | None = None) -> tuple[int, dict]:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    api_request = Request(base + path, data=data, method=method)
+    if data is not None:
+        api_request.add_header("Content-Type", "application/json")
     try:
-        with urlopen(Request(base + path), timeout=5) as response:
+        with urlopen(api_request, timeout=5) as response:
             return response.status, json.loads(response.read())
     except HTTPError as error:
         return error.code, json.loads(error.read())
@@ -251,6 +255,154 @@ def test_report_generation_does_not_change_phase6_review_store(report_api, monke
     assert backend.REVIEW_STORE.get_case("PM-118") == before_record
     assert sample_path.read_bytes() == before_sample
     assert (store_path.read_bytes() if store_path.exists() else None) == before_store
+
+
+def test_trusted_transaction_review_open_is_exact_idempotent_and_persistent(report_api, monkeypatch):
+    base, _, _, _ = report_api
+    lookup_calls = []
+    original_lookup = backend.INVESTIGATOR.lookup_transaction
+
+    def tracked_lookup(transaction_id):
+        lookup_calls.append(transaction_id)
+        return original_lookup(transaction_id)
+
+    monkeypatch.setattr(backend.INVESTIGATOR, "lookup_transaction", tracked_lookup)
+    monkeypatch.setattr(ml.predict, "predict_procurement_data", lambda *args, **kwargs: pytest.fail("case opening must not generate a full report"))
+
+    status, opened = request(base, "/api/cases", method="POST", body={"transaction_id": "TXN-1234567"})
+    assert status == 201
+    case = opened["case"]
+    assert case["transaction_id"] == "TXN-1234567"
+    assert case["review_status"] == "OPEN"
+    assert case["investigation_decision"] is None
+    case_id = case["id"]
+
+    status, repeated = request(base, "/api/cases", method="POST", body={"transaction_id": "TXN-1234567"})
+    assert status == 200
+    assert repeated["case"]["id"] == case_id
+    assert lookup_calls == ["TXN-1234567"]
+
+    status, updated = request(base, f"/api/cases/{case_id}", method="PATCH", body={
+        "review_status": "REVIEWING",
+        "investigation_decision": "NEEDS_MORE_INFORMATION",
+        "note": "Request the signed purchase order.",
+    })
+    assert status == 200
+    assert updated["case"]["review_status"] == "REVIEWING"
+    assert updated["case"]["investigation_decision"] == "NEEDS_MORE_INFORMATION"
+    assert "Request the signed purchase order." in updated["case"]["investigation_notes"]
+
+    status, detail = request(base, f"/api/cases/{case_id}")
+    assert status == 200
+    assert detail["case"] == updated["case"]
+    status, history = request(base, f"/api/cases/{case_id}/history")
+    assert status == 200
+    assert history["review_history"] == updated["case"]["review_history"]
+
+
+def test_trusted_case_open_rejects_invalid_missing_and_unknown_ids(report_api):
+    base = report_api[0]
+    assert request(base, "/api/cases", method="POST", body={"transaction_id": "TXN-"})[0] == 400
+    assert request(base, "/api/cases", method="POST", body={})[0] == 400
+    status, payload = request(base, "/api/cases", method="POST", body={
+        "transaction_id": "TXN-9999999",
+        "dataset_path": "/etc/passwd",
+        "transaction": raw_row("TXN-9999999"),
+    })
+    assert status == 404 and "error" in payload
+    status, cases = request(base, "/api/cases")
+    assert status == 200
+    assert not any(case["transaction_id"] in {"TXN-", "TXN-9999999"} for case in cases["cases"])
+
+
+def test_trusted_case_open_rejects_duplicate_and_unavailable_source(report_api, monkeypatch):
+    base, dataset_path, _, _ = report_api
+    pd.DataFrame([raw_row("TXN-1234567"), raw_row("TXN-1234567")]).to_csv(dataset_path, index=False)
+    status, payload = request(base, "/api/cases", method="POST", body={"transaction_id": "TXN-1234567"})
+    assert status == 409 and "error" in payload
+    cases = request(base, "/api/cases")[1]["cases"]
+    assert not any(case["transaction_id"] == "TXN-1234567" for case in cases)
+
+    monkeypatch.setattr(
+        backend.INVESTIGATOR,
+        "lookup_transaction",
+        lambda _transaction_id: (_ for _ in ()).throw(investigator.TransactionSourceUnavailableError("unavailable")),
+    )
+    status, payload = request(base, "/api/cases", method="POST", body={"transaction_id": "TXN-12345678"})
+    assert status == 503 and "error" in payload
+    cases = request(base, "/api/cases")[1]["cases"]
+    assert not any(case["transaction_id"] in {"TXN-1234567", "TXN-12345678"} for case in cases)
+
+
+def test_concurrent_trusted_case_open_returns_one_active_case(report_api, monkeypatch):
+    base = report_api[0]
+    request_count = 8
+    lookup_barrier = threading.Barrier(request_count)
+    original_lookup = backend.INVESTIGATOR.lookup_transaction
+
+    def synchronized_lookup(transaction_id):
+        lookup_barrier.wait(timeout=5)
+        return original_lookup(transaction_id)
+
+    monkeypatch.setattr(backend.INVESTIGATOR, "lookup_transaction", synchronized_lookup)
+
+    def open_case(_):
+        return request(base, "/api/cases", method="POST", body={"transaction_id": "TXN-1234567"})
+
+    with ThreadPoolExecutor(max_workers=request_count) as pool:
+        responses = list(pool.map(open_case, range(request_count)))
+
+    assert all(status in {200, 201} for status, _ in responses)
+    case_ids = {payload["case"]["id"] for _, payload in responses}
+    assert len(case_ids) == 1
+    assert sum(status == 201 for status, _ in responses) == 1
+    cases = request(base, "/api/cases")[1]["cases"]
+    active = [case for case in cases if case["transaction_id"] == "TXN-1234567" and case["review_status"] != "RESOLVED"]
+    assert len(active) == 1
+    assert active[0]["id"] in case_ids
+
+
+def test_resolved_trusted_case_reopens_as_new_case_without_changing_old_history(report_api, monkeypatch):
+    base = report_api[0]
+    lookup_calls = []
+    original_lookup = backend.INVESTIGATOR.lookup_transaction
+
+    def tracked_lookup(transaction_id):
+        lookup_calls.append(transaction_id)
+        return original_lookup(transaction_id)
+
+    monkeypatch.setattr(backend.INVESTIGATOR, "lookup_transaction", tracked_lookup)
+    status, first = request(base, "/api/cases", method="POST", body={"transaction_id": "TXN-1234567"})
+    assert status == 201
+    resolved_id = first["case"]["id"]
+    status, resolved = request(base, f"/api/cases/{resolved_id}", method="PATCH", body={
+        "review_status": "RESOLVED",
+        "investigation_decision": "NEEDS_MORE_INFORMATION",
+        "note": "Original investigation completed.",
+    })
+    assert status == 200
+    original_record = resolved["case"]
+    original_history = original_record["review_history"]
+
+    status, reopened = request(base, "/api/cases", method="POST", body={"transaction_id": "TXN-1234567"})
+    assert status == 201
+    new_record = reopened["case"]
+    assert new_record["id"] != resolved_id
+    assert new_record["transaction_id"] == "TXN-1234567"
+    assert new_record["review_status"] == "OPEN"
+    assert len(new_record["review_history"]) == 1
+    assert new_record["review_history"][0]["event_type"] == "investigation_opened"
+
+    status, reloaded_old = request(base, f"/api/cases/{resolved_id}")
+    assert status == 200
+    assert reloaded_old["case"] == original_record
+    assert reloaded_old["case"]["review_history"] == original_history
+    status, cases = request(base, "/api/cases")
+    assert status == 200
+    transaction_cases = [case for case in cases["cases"] if case["transaction_id"] == "TXN-1234567"]
+    assert {case["id"] for case in transaction_cases} == {resolved_id, new_record["id"]}
+    assert sum(case["review_status"] != "RESOLVED" for case in transaction_cases) == 1
+    assert lookup_calls == ["TXN-1234567", "TXN-1234567"]
 
 
 def write_trusted_dataset(path: Path, rows: list[dict[str, object]]) -> None:

@@ -150,7 +150,27 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             if body is None:
                 return self.send_api_error(HTTPStatus.BAD_REQUEST, "Malformed JSON request body.")
             try:
-                case, created = REVIEW_STORE.open_case(body.get("transaction_id"), body.get("reviewer_id"))
+                transaction_id = body.get("transaction_id")
+                try:
+                    case, created = REVIEW_STORE.open_case(transaction_id, body.get("reviewer_id"))
+                except ReviewNotFoundError:
+                    # Preserve the sample-ID path. Only TXN-prefixed IDs may be
+                    # checked against the fixed trusted dataset, by exact lookup.
+                    if not isinstance(transaction_id, str) or not transaction_id.startswith("TXN-"):
+                        raise
+                    case, created = REVIEW_STORE.open_trusted_case(
+                        transaction_id,
+                        body.get("reviewer_id"),
+                        trusted_lookup=INVESTIGATOR.lookup_transaction,
+                    )
+            except InvalidTransactionIdError as exc:
+                return self.send_api_error(HTTPStatus.BAD_REQUEST, str(exc))
+            except TransactionNotFoundError as exc:
+                return self.send_api_error(HTTPStatus.NOT_FOUND, str(exc))
+            except AmbiguousTransactionError as exc:
+                return self.send_api_error(HTTPStatus.CONFLICT, str(exc))
+            except TransactionSourceUnavailableError:
+                return self.send_api_error(HTTPStatus.SERVICE_UNAVAILABLE, "Trusted transaction data is unavailable.")
             except ReviewValidationError as exc:
                 return self.send_api_error(HTTPStatus.BAD_REQUEST, str(exc))
             except ReviewNotFoundError as exc:

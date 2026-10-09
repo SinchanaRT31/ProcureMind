@@ -1,6 +1,7 @@
 const state = {
   dashboard: null,
   transactions: [],
+  investigationReport: null,
 };
 
 const currencyFormatter = new Intl.NumberFormat("en-US", {
@@ -24,7 +25,8 @@ function formatAmount(amount) {
 }
 
 function riskClass(level) {
-  return level.toLowerCase().split(" ")[0];
+  const normalized = String(level ?? "").toLowerCase().split(/\s+/)[0];
+  return ["high", "medium", "low", "critical"].includes(normalized) ? normalized : "low";
 }
 
 async function fetchJson(url, options = {}) {
@@ -37,7 +39,9 @@ async function fetchJson(url, options = {}) {
     } catch (_) {
       // Keep the HTTP status message when a response has no JSON body.
     }
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -228,7 +232,344 @@ function caseCard(caseItem) {
 }
 
 function renderCases(cases) {
-  el("cases-list").innerHTML = cases.map(caseCard).join("");
+  const sampleIds = new Set((state.dashboard?.transactions || []).map((item) => item.id));
+  const sampleCases = cases.filter((caseItem) => sampleIds.has(caseItem.transaction_id));
+  el("cases-list").innerHTML = sampleCases.length
+    ? sampleCases.map(caseCard).join("")
+    : '<p class="helper">No sample review cases are available.</p>';
+}
+
+function createTextElement(tagName, text, className = "") {
+  const node = document.createElement(tagName);
+  node.textContent = text == null ? "" : String(text);
+  if (className) node.className = className;
+  return node;
+}
+
+function reportLabel(value) {
+  return String(value).replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function appendReportValue(container, value) {
+  if (Array.isArray(value)) {
+    if (!value.length) {
+      container.append(createTextElement("p", "No items were returned.", "helper"));
+      return;
+    }
+    const list = document.createElement("ul");
+    for (const item of value) {
+      const entry = document.createElement("li");
+      appendReportValue(entry, item);
+      list.append(entry);
+    }
+    container.append(list);
+    return;
+  }
+  if (value && typeof value === "object") {
+    const details = document.createElement("dl");
+    details.className = "report-details";
+    for (const [key, item] of Object.entries(value)) {
+      const term = createTextElement("dt", reportLabel(key));
+      const description = document.createElement("dd");
+      appendReportValue(description, item);
+      details.append(term, description);
+    }
+    container.append(details);
+    return;
+  }
+  container.append(createTextElement("p", value == null ? "Not provided." : value));
+}
+
+function appendReportSection(container, title, value) {
+  if (value === undefined || value === null) return;
+  const section = document.createElement("section");
+  section.className = "report-section";
+  section.append(createTextElement("h4", title));
+  appendReportValue(section, value);
+  container.append(section);
+}
+
+function renderInvestigationReport(report) {
+  const container = el("investigation-results");
+  container.replaceChildren();
+  const header = document.createElement("div");
+  header.className = "report-heading";
+  header.append(
+    createTextElement("h3", `Trusted investigation · ${report.transaction_id || "Transaction"}`),
+    createTextElement("p", `Report schema ${report.schema_version || "not specified"} · generated from the trusted dataset`, "helper"),
+  );
+  container.append(header);
+
+  const whyFlagged = report.why_flagged;
+  if (whyFlagged && typeof whyFlagged === "object") {
+    appendReportSection(container, "Model anomaly signal", whyFlagged.model_prediction);
+    appendReportSection(container, "SHAP explanation", whyFlagged.model_explanation);
+  }
+  appendReportSection(container, "Supporting findings and risk priority", report.supporting_findings);
+  appendReportSection(container, "Verification and inconclusive or conflicting findings", report.inconclusive_or_conflicting);
+  appendReportSection(container, "Missing information", report.missing_information);
+  appendReportSection(container, "Follow-up checks", report.follow_up_checks);
+  appendReportSection(container, "Limitations", report.limitations);
+  container.append(createTextElement(
+    "p",
+    "Model anomaly signals and investigation evidence are not human decisions. An anomaly score is not a fraud probability and does not prove fraud.",
+    "report-caution",
+  ));
+}
+
+function appendReviewField(container, labelText, control) {
+  const label = document.createElement("label");
+  label.append(createTextElement("span", labelText), control);
+  container.append(label);
+}
+
+function createReviewSelect(className, options, selectedValue) {
+  const select = document.createElement("select");
+  select.className = className;
+  for (const option of options) {
+    const element = document.createElement("option");
+    element.value = option.value;
+    element.textContent = option.label;
+    element.selected = option.value === (selectedValue ?? "");
+    select.append(element);
+  }
+  return select;
+}
+
+function renderReviewHistory(events) {
+  const details = document.createElement("details");
+  details.className = "review-history";
+  details.append(createTextElement("summary", `Review history (${events.length})`));
+  const list = document.createElement("ol");
+  if (!events.length) list.append(createTextElement("li", "No review events yet."));
+  for (const event of events) {
+    const item = document.createElement("li");
+    item.className = "review-event";
+    const reviewer = event.reviewer_id ? ` · ${event.reviewer_id}` : "";
+    item.append(
+      createTextElement("strong", String(event.event_type || "Review event").replaceAll("_", " ")),
+      createTextElement("span", `${event.timestamp || ""}${reviewer}`, "helper"),
+      createTextElement("div", JSON.stringify(event.changes || {})),
+    );
+    list.append(item);
+  }
+  details.append(list);
+  return details;
+}
+
+function renderTrustedReview(transactionId, caseItem = null, history = []) {
+  const container = el("trusted-review");
+  container.replaceChildren();
+  delete container.dataset.caseId;
+  const heading = createTextElement("h3", "Human review · separate from model findings");
+  container.append(heading);
+  if (!caseItem) {
+    container.append(createTextElement("p", "No review case is recorded for this trusted transaction."));
+    const openButton = createTextElement("button", "Open review case", "button primary open-trusted-review");
+    openButton.type = "button";
+    container.append(openButton);
+    return;
+  }
+
+  container.dataset.caseId = caseItem.id;
+  container.append(createTextElement("p", `Case ${caseItem.id} · ${transactionId}`, "helper"));
+  const fields = document.createElement("dl");
+  fields.className = "review-summary";
+  for (const [label, value] of [
+    ["Persisted review status", caseItem.review_status],
+    ["Investigation decision", caseItem.investigation_decision || "No decision recorded"],
+    ["Reviewer", caseItem.reviewer_id || "Not specified"],
+  ]) {
+    fields.append(createTextElement("dt", label), createTextElement("dd", value));
+  }
+  container.append(fields);
+  container.append(createTextElement("h4", "Persisted investigation notes"));
+  container.append(createTextElement("p", caseItem.investigation_notes || "No notes recorded.", "existing-notes"));
+
+  const form = document.createElement("form");
+  form.className = "trusted-review-form";
+  const controls = document.createElement("div");
+  controls.className = "trusted-review-controls";
+  appendReviewField(controls, "Review status", createReviewSelect("trusted-review-status", [
+    { value: "OPEN", label: "OPEN" },
+    { value: "REVIEWING", label: "REVIEWING" },
+    { value: "RESOLVED", label: "RESOLVED" },
+  ], caseItem.review_status));
+  appendReviewField(controls, "Investigation decision", createReviewSelect("trusted-review-decision", [
+    { value: "", label: "No decision recorded" },
+    { value: "CONFIRMED_ISSUE", label: "CONFIRMED_ISSUE" },
+    { value: "NO_ISSUE_FOUND", label: "NO_ISSUE_FOUND" },
+    { value: "NEEDS_MORE_INFORMATION", label: "NEEDS_MORE_INFORMATION" },
+    { value: "ESCALATED", label: "ESCALATED" },
+  ], caseItem.investigation_decision));
+  const reviewer = document.createElement("input");
+  reviewer.className = "trusted-reviewer-id";
+  reviewer.type = "text";
+  reviewer.maxLength = 200;
+  reviewer.value = caseItem.reviewer_id || "";
+  reviewer.placeholder = "Optional; this app does not authenticate reviewers";
+  appendReviewField(controls, "Reviewer identifier (optional)", reviewer);
+  const note = document.createElement("textarea");
+  note.className = "trusted-review-note";
+  note.rows = 3;
+  note.maxLength = 10000;
+  note.placeholder = "Add a review note";
+  appendReviewField(controls, "Add a note", note);
+  form.append(controls);
+  const actions = document.createElement("div");
+  actions.className = "case-status-row";
+  const saveButton = createTextElement("button", "Save review", "button primary save-trusted-review");
+  saveButton.type = "submit";
+  actions.append(saveButton, createTextElement("span", "", "trusted-review-status-message"));
+  form.append(actions);
+  container.append(form, renderReviewHistory(history));
+
+  if (caseItem.review_status === "RESOLVED") {
+    const reopenButton = createTextElement("button", "Open a new review case", "button secondary open-trusted-review");
+    reopenButton.type = "button";
+    container.append(reopenButton);
+  }
+}
+
+async function refreshTrustedReview(transactionId, preferredCaseId = null) {
+  const container = el("trusted-review");
+  container.setAttribute("aria-busy", "true");
+  container.replaceChildren(createTextElement("p", "Loading persisted review information…", "helper"));
+  try {
+    const payload = await fetchJson("/api/cases");
+    const matches = (Array.isArray(payload.cases) ? payload.cases : [])
+      .filter((item) => item.transaction_id === transactionId);
+    const active = matches.find((item) => item.review_status !== "RESOLVED");
+    const selected = (preferredCaseId && matches.find((item) => item.id === preferredCaseId))
+      || active
+      || matches[matches.length - 1];
+    if (!selected) {
+      renderTrustedReview(transactionId);
+      return true;
+    }
+    const caseId = encodeURIComponent(selected.id);
+    const [detailPayload, historyPayload] = await Promise.all([
+      fetchJson(`/api/cases/${caseId}`),
+      fetchJson(`/api/cases/${caseId}/history`),
+    ]);
+    renderTrustedReview(transactionId, detailPayload.case, Array.isArray(historyPayload.review_history) ? historyPayload.review_history : []);
+    return true;
+  } catch (error) {
+    container.replaceChildren(createTextElement("h3", "Human review"), createTextElement("p", `Could not load persisted review information: ${apiErrorMessage(error, "review")}`, "error-message"));
+    return false;
+  } finally {
+    container.setAttribute("aria-busy", "false");
+  }
+}
+
+function apiErrorMessage(error, operation) {
+  if (error.status === 400) return error.message || "The transaction ID or review fields are invalid.";
+  if (error.status === 404) return operation === "report" ? "No exact transaction ID match was found." : "The review case or transaction was not found.";
+  if (error.status === 409) return "Multiple exact transaction IDs were found. The investigation cannot continue until the source data is unambiguous.";
+  if (error.status === 503) return "The trusted transaction or report service is unavailable. Try again later.";
+  if (error.status >= 500) return "The request could not be completed. Try again later.";
+  if (!error.status) return "The ProcureMind service could not be reached.";
+  return error.message || `Request failed (${error.status}).`;
+}
+
+async function submitInvestigation(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const input = form.elements.transaction_id;
+  const transactionId = input.value.trim();
+  const button = el("investigation-submit");
+  const status = el("investigation-status");
+  const results = el("investigation-results");
+  const review = el("trusted-review");
+  if (!transactionId) {
+    status.textContent = "Enter a trusted transaction ID.";
+    return;
+  }
+  button.disabled = true;
+  status.className = "investigation-status";
+  status.textContent = "Generating the investigation report…";
+  results.replaceChildren();
+  review.replaceChildren();
+  results.setAttribute("aria-busy", "true");
+  try {
+    const params = new URLSearchParams({ transaction_id: transactionId });
+    const payload = await fetchJson(`/api/investigations/report?${params.toString()}`);
+    if (!payload.report || typeof payload.report !== "object" || payload.report.transaction_id !== transactionId) {
+      const error = new Error("The report response did not match the requested transaction.");
+      error.status = 500;
+      throw error;
+    }
+    state.investigationReport = payload.report;
+    renderInvestigationReport(payload.report);
+    status.textContent = "Report loaded from the trusted transaction source.";
+    await refreshTrustedReview(transactionId);
+  } catch (error) {
+    state.investigationReport = null;
+    status.className = "investigation-status error-message";
+    status.textContent = apiErrorMessage(error, "report");
+  } finally {
+    button.disabled = false;
+    results.setAttribute("aria-busy", "false");
+  }
+}
+
+async function openTrustedReview(event) {
+  const button = event.target.closest(".open-trusted-review");
+  if (!button || !state.investigationReport) return;
+  const transactionId = state.investigationReport.transaction_id;
+  button.disabled = true;
+  button.textContent = "Opening review case…";
+  try {
+    const payload = await fetchJson("/api/cases", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transaction_id: transactionId }),
+    });
+    const refreshed = await refreshTrustedReview(transactionId, payload.case?.id || null);
+    el("investigation-status").textContent = refreshed
+      ? "Review case opened or retrieved from persisted records."
+      : "Review case saved, but its persisted details could not be refreshed.";
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "Open review case";
+    const message = createTextElement("p", apiErrorMessage(error, "review"), "error-message");
+    el("trusted-review").append(message);
+  }
+}
+
+async function saveTrustedReview(event) {
+  if (!event.target.matches(".trusted-review-form")) return;
+  event.preventDefault();
+  const form = event.target;
+  const container = form.closest("#trusted-review");
+  const caseId = container.dataset.caseId;
+  const transactionId = state.investigationReport?.transaction_id;
+  const button = form.querySelector(".save-trusted-review");
+  const message = form.querySelector(".trusted-review-status-message");
+  if (!caseId || !transactionId) return;
+  const body = {
+    review_status: form.querySelector(".trusted-review-status").value,
+    investigation_decision: form.querySelector(".trusted-review-decision").value || null,
+    reviewer_id: form.querySelector(".trusted-reviewer-id").value,
+  };
+  const note = form.querySelector(".trusted-review-note").value;
+  if (note.trim()) body.note = note;
+  button.disabled = true;
+  message.textContent = "Saving review…";
+  try {
+    await fetchJson(`/api/cases/${encodeURIComponent(caseId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const refreshed = await refreshTrustedReview(transactionId, caseId);
+    el("investigation-status").textContent = refreshed
+      ? "Review changes saved and reloaded from persisted records."
+      : "Review changes saved, but persisted details could not be refreshed.";
+  } catch (error) {
+    message.textContent = apiErrorMessage(error, "review");
+    button.disabled = false;
+  }
 }
 
 async function loadDashboard() {
@@ -319,8 +660,11 @@ async function openInvestigation(event) {
 }
 
 document.getElementById("filters-form").addEventListener("submit", applyFilters);
+document.getElementById("investigation-form").addEventListener("submit", submitInvestigation);
 document.getElementById("cases-list").addEventListener("click", saveCase);
 document.getElementById("transactions-body").addEventListener("click", openInvestigation);
+document.getElementById("trusted-review").addEventListener("click", openTrustedReview);
+document.getElementById("trusted-review").addEventListener("submit", saveTrustedReview);
 
 loadDashboard().catch(() => {
   el("topbar-alert").textContent = "Unable to load dashboard data.";

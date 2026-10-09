@@ -29,7 +29,7 @@
       <main class="main-content">
         <header class="topbar" id="dashboard">
           <div>
-            <h2>Risk monitoring dashboard</h2>
+            <h2>Risk monitoring dashboard · sample data</h2>
             <p id="topbar-alert">Loading alert summary...</p>
           </div>
           <div class="topbar-actions">
@@ -38,6 +38,27 @@
           </div>
         </header>
 
+        <p class="sample-data-banner">Summary metrics, charts, vendors, transactions, duplicate examples, and the case list below are demonstration data. Trusted dataset investigations appear separately.</p>
+
+        <section class="card investigation-card" id="investigation-panel">
+          <div class="card-head">
+            <div>
+              <h3>Investigate a trusted transaction</h3>
+              <p>Enter an exact transaction ID from the trusted procurement dataset. Sample dashboard IDs are not mapped to dataset IDs.</p>
+            </div>
+          </div>
+          <form id="investigation-form" class="investigation-form">
+            <label for="investigation-transaction-id">Trusted transaction ID</label>
+            <div class="investigation-form-row">
+              <input id="investigation-transaction-id" name="transaction_id" type="text" maxlength="68" autocomplete="off" spellcheck="false" placeholder="TXN-0000001" required />
+              <button class="button primary" id="investigation-submit" type="submit">Generate report</button>
+            </div>
+          </form>
+          <p id="investigation-status" class="investigation-status" role="status" aria-live="polite"></p>
+          <div id="investigation-results" class="investigation-results" aria-live="polite"></div>
+          <div id="trusted-review" class="trusted-review" aria-live="polite"></div>
+        </section>
+
         <section class="stats-grid" id="stats-grid"></section>
 
         <section class="content-grid">
@@ -45,7 +66,7 @@
             <div class="card-head">
               <div>
                 <h3>Weekly risk trend</h3>
-                <p>Anomaly pressure across recent procurement activity</p>
+                <p>Sample anomaly pressure across recent procurement activity</p>
               </div>
             </div>
             <div id="risk-trend" class="trend-chart"></div>
@@ -118,7 +139,7 @@
             <div class="card-head">
               <div>
                 <h3>Vendor risk scoring</h3>
-                <p>Dynamic profile based on anomalies and spend behaviour</p>
+                <p>Sample profiles based on demonstration anomalies and spend behaviour</p>
               </div>
             </div>
             <div id="vendors-list" class="stack"></div>
@@ -128,7 +149,7 @@
             <div class="card-head">
               <div>
                 <h3>Explainability</h3>
-                <p>Why the highest-risk transaction was flagged</p>
+                <p>Sample explanation for the highest-risk demonstration transaction</p>
               </div>
             </div>
             <div id="highlight-panel" class="highlight-panel"></div>
@@ -140,7 +161,7 @@
             <div class="card-head">
               <div>
                 <h3>Duplicate and near-duplicate invoices</h3>
-                <p>Similarity review queue</p>
+                <p>Sample similarity review queue</p>
               </div>
             </div>
             <div id="duplicates-list" class="stack"></div>
