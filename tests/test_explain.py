@@ -1,4 +1,5 @@
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,11 +11,18 @@ import pandas as pd
 import pytest
 import shap
 
+import ml.explain as explain_module
 from ml.explain import ADDITIVITY_ATOL, _explain_features, explain_predictions
 from ml.predict import predict_procurement_data
 from ml.preprocess import ProcurementFeatureTransformer
 from sklearn.ensemble import IsolationForest
 from test_preprocess import raw_frame
+
+
+def _assert_rng_states_equal(actual, expected):
+    assert actual[0] == expected[0]
+    np.testing.assert_array_equal(actual[1], expected[1])
+    assert actual[2:] == expected[2:]
 
 
 def test_explain_predictions_returns_top_feature_contributions():
@@ -52,6 +60,93 @@ def test_shap_reconstructs_exact_anomaly_score_and_preserves_feature_order():
     assert list(rows.columns) == transformer.feature_names_
     # Efficiency axiom gives signed contributions relative to the baseline.
     assert np.allclose(values.sum(axis=1), scores - bases, atol=ADDITIVITY_ATOL, rtol=1e-6)
+
+
+def test_repeated_explanations_are_reproducible_and_restore_numpy_rng_state():
+    raw = raw_frame()
+    train, row = raw.iloc[:3], raw.iloc[[3]]
+    transformer = ProcurementFeatureTransformer().fit(train)
+    background = transformer.transform(train)
+    model = IsolationForest(n_estimators=20, random_state=42).fit(background)
+
+    original_state = np.random.get_state()
+    try:
+        np.random.seed(8675309)
+        expected_state = np.random.get_state()
+        first = explain_predictions(row, model=model, transformer=transformer, background_features=background)
+        _assert_rng_states_equal(np.random.get_state(), expected_state)
+        second = explain_predictions(row, model=model, transformer=transformer, background_features=background)
+        _assert_rng_states_equal(np.random.get_state(), expected_state)
+
+        feature_columns = [f"top_feature_{rank}" for rank in range(1, 4)]
+        contribution_columns = [f"top_contribution_{rank}" for rank in range(1, 4)]
+        assert first[feature_columns].values.tolist() == second[feature_columns].values.tolist()
+        np.testing.assert_allclose(
+            first[contribution_columns].to_numpy(dtype=float),
+            second[contribution_columns].to_numpy(dtype=float),
+            rtol=1e-12,
+            atol=1e-12,
+            equal_nan=True,
+        )
+    finally:
+        np.random.set_state(original_state)
+
+
+def test_numpy_rng_state_is_restored_when_shap_explanation_raises(monkeypatch):
+    raw = raw_frame()
+    transformer = ProcurementFeatureTransformer().fit(raw.iloc[:3])
+    features = transformer.transform(raw.iloc[[3]])
+    background = transformer.transform(raw.iloc[:3])
+    model = IsolationForest(n_estimators=10, random_state=42).fit(background)
+
+    original_state = np.random.get_state()
+    try:
+        np.random.seed(12345)
+        expected_state = np.random.get_state()
+
+        def failing_explainer(*args, seed=None, **kwargs):
+            np.random.seed(seed)
+            raise RuntimeError("simulated SHAP failure")
+
+        monkeypatch.setattr(explain_module.shap, "Explainer", failing_explainer)
+        with pytest.raises(RuntimeError, match="simulated SHAP failure"):
+            _explain_features(features, model=model, background_features=background, batch_size=1)
+        _assert_rng_states_equal(np.random.get_state(), expected_state)
+    finally:
+        np.random.set_state(original_state)
+
+
+def test_concurrent_explanations_are_reproducible_and_restore_numpy_rng_state():
+    raw = raw_frame()
+    train, row = raw.iloc[:3], raw.iloc[[3]]
+    transformer = ProcurementFeatureTransformer().fit(train)
+    background = transformer.transform(train)
+    model = IsolationForest(n_estimators=20, random_state=42).fit(background)
+
+    original_state = np.random.get_state()
+    try:
+        np.random.seed(24680)
+        expected_state = np.random.get_state()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(
+                lambda _: explain_predictions(row, model=model, transformer=transformer, background_features=background),
+                range(4),
+            ))
+        _assert_rng_states_equal(np.random.get_state(), expected_state)
+
+        feature_columns = [f"top_feature_{rank}" for rank in range(1, 4)]
+        contribution_columns = [f"top_contribution_{rank}" for rank in range(1, 4)]
+        for result in results[1:]:
+            assert result[feature_columns].values.tolist() == results[0][feature_columns].values.tolist()
+            np.testing.assert_allclose(
+                result[contribution_columns].to_numpy(dtype=float),
+                results[0][contribution_columns].to_numpy(dtype=float),
+                rtol=1e-12,
+                atol=1e-12,
+                equal_nan=True,
+            )
+    finally:
+        np.random.set_state(original_state)
 
 
 def test_permutation_shap_sign_tracks_known_score_direction():

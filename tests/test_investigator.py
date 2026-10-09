@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import sqlite3
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -247,3 +251,275 @@ def test_report_generation_does_not_change_phase6_review_store(report_api, monke
     assert backend.REVIEW_STORE.get_case("PM-118") == before_record
     assert sample_path.read_bytes() == before_sample
     assert (store_path.read_bytes() if store_path.exists() else None) == before_store
+
+
+def write_trusted_dataset(path: Path, rows: list[dict[str, object]]) -> None:
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def current_csv_lookup(path: Path, transaction_id: str) -> pd.DataFrame:
+    matches = []
+    for chunk in pd.read_csv(
+        path,
+        usecols=investigator.RAW_TRANSACTION_COLUMNS,
+        dtype={"transaction_id": "string"},
+        chunksize=investigator.CSV_CHUNK_SIZE,
+    ):
+        matches.extend(chunk.loc[chunk["transaction_id"] == transaction_id].to_dict("records"))
+    return pd.DataFrame(matches, columns=investigator.RAW_TRANSACTION_COLUMNS).loc[:, investigator.RAW_TRANSACTION_COLUMNS]
+
+
+def test_sqlite_lookup_matches_csv_values_and_preserves_only_allowlisted_columns(tmp_path):
+    dataset_path = tmp_path / "trusted.csv"
+    row = raw_row("TXN-A_2")
+    row.update({"vendor_rating": None, "quantity": "unusual quantity", "unit_price": 0, "vendor_location": "North, West"})
+    write_trusted_dataset(dataset_path, [row])
+
+    actual = InvestigatorReportService(dataset_path).lookup_transaction("TXN-A_2")
+    expected = current_csv_lookup(dataset_path, "TXN-A_2")
+
+    assert list(actual.columns) == list(investigator.RAW_TRANSACTION_COLUMNS)
+    pd.testing.assert_frame_equal(actual, expected, check_dtype=False)
+    assert actual.loc[0, "quantity"] == "unusual quantity"
+    assert pd.isna(actual.loc[0, "vendor_rating"])
+    assert "actual_anomaly" not in actual.columns
+
+
+def test_sqlite_lookup_preserves_not_found_and_duplicate_statuses_across_chunks(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "trusted.csv"
+    write_trusted_dataset(dataset_path, [
+        raw_row("TXN-FIRST1"),
+        raw_row("TXN-OTHER1"),
+        raw_row("TXN-FIRST1"),
+        raw_row("TXN-FIRST1"),
+    ])
+    monkeypatch.setattr(investigator, "CSV_CHUNK_SIZE", 1)
+    service = InvestigatorReportService(dataset_path)
+
+    with pytest.raises(investigator.TransactionNotFoundError):
+        service.lookup_transaction("TXN-ABSENT1")
+    with pytest.raises(investigator.AmbiguousTransactionError):
+        service.lookup_transaction("TXN-FIRST1")
+    with sqlite3.connect(service._index_path) as connection:
+        stored_rows = connection.execute(
+            "SELECT COUNT(*) FROM transactions WHERE transaction_id = ? COLLATE BINARY", ("TXN-FIRST1",)
+        ).fetchone()[0]
+        stored_columns = [row[1] for row in connection.execute("PRAGMA table_info(transactions)")][1:]
+    assert stored_rows == 3
+    assert stored_columns == list(investigator.RAW_TRANSACTION_COLUMNS)
+
+
+@pytest.mark.parametrize("contents,expected", [
+    ("", "unavailable"),
+    ("transaction_id,vendor_id\nTXN-EMPTY01,V-1\n", "unavailable"),
+    ("transaction_id,vendor_id,vendor_rating,department_id,item_category,quantity,unit_price,total_amount,order_date,invoice_date,due_date,payment_status,purchase_type,vendor_location\n", "not_found"),
+])
+def test_empty_or_malformed_dataset_has_controlled_lookup_result(tmp_path, contents, expected):
+    dataset_path = tmp_path / "trusted.csv"
+    dataset_path.write_text(contents, encoding="utf-8")
+    service = InvestigatorReportService(dataset_path)
+
+    error = investigator.TransactionSourceUnavailableError if expected == "unavailable" else investigator.TransactionNotFoundError
+    with pytest.raises(error):
+        service.lookup_transaction("TXN-EMPTY01")
+
+
+def test_failed_atomic_publish_leaves_no_partial_or_stale_index(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "trusted.csv"
+    write_trusted_dataset(dataset_path, [raw_row("TXN-FAIL001")])
+    service = InvestigatorReportService(dataset_path)
+
+    def fail_replace(source, destination):
+        raise OSError("simulated publish failure")
+
+    monkeypatch.setattr(investigator.os, "replace", fail_replace)
+    with pytest.raises(investigator.TransactionSourceUnavailableError):
+        service.lookup_transaction("TXN-FAIL001")
+    assert not service._index_path.exists()
+    assert list(service._index_path.parent.glob("*.tmp")) == []
+
+
+def test_corrupt_index_is_rebuilt_from_the_trusted_source(tmp_path):
+    dataset_path = tmp_path / "trusted.csv"
+    write_trusted_dataset(dataset_path, [raw_row("TXN-CORRUPT1")])
+    service = InvestigatorReportService(dataset_path)
+    assert service.lookup_transaction("TXN-CORRUPT1").iloc[0]["transaction_id"] == "TXN-CORRUPT1"
+
+    service._index_path.write_bytes(b"not a sqlite database")
+    rebuilt = service.lookup_transaction("TXN-CORRUPT1")
+    assert rebuilt.iloc[0]["transaction_id"] == "TXN-CORRUPT1"
+    with sqlite3.connect(service._index_path) as connection:
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+
+def test_valid_index_content_digest_matches_stored_rows(tmp_path):
+    dataset_path = tmp_path / "trusted.csv"
+    write_trusted_dataset(dataset_path, [raw_row("TXN-DIGEST01"), raw_row("TXN-DIGEST02")])
+    service = InvestigatorReportService(dataset_path)
+    service.lookup_transaction("TXN-DIGEST01")
+
+    assert service._index_matches_source(investigator._sha256_file(dataset_path))
+
+
+def test_full_content_digest_is_not_recomputed_on_ordinary_lookup(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "trusted.csv"
+    write_trusted_dataset(dataset_path, [raw_row("TXN-ONCE001")])
+    original_digest = investigator._index_content_digest
+    digest_calls = 0
+
+    def counted_digest(connection):
+        nonlocal digest_calls
+        digest_calls += 1
+        return original_digest(connection)
+
+    monkeypatch.setattr(investigator, "_index_content_digest", counted_digest)
+    service = InvestigatorReportService(dataset_path)
+    service.lookup_transaction("TXN-ONCE001")
+    assert digest_calls == 1
+    service.lookup_transaction("TXN-ONCE001")
+    assert digest_calls == 1
+
+
+@pytest.mark.parametrize("corruption", ["field", "delete_with_updated_count", "transaction_id"])
+def test_content_validation_rejects_valid_sqlite_with_altered_rows(tmp_path, corruption):
+    dataset_path = tmp_path / "trusted.csv"
+    write_trusted_dataset(dataset_path, [raw_row("TXN-CONTENT1"), raw_row("TXN-CONTENT2")])
+    service = InvestigatorReportService(dataset_path)
+    service.lookup_transaction("TXN-CONTENT1")
+
+    with sqlite3.connect(service._index_path) as connection:
+        if corruption == "field":
+            connection.execute(
+                "UPDATE transactions SET vendor_location = ? WHERE transaction_id = ?",
+                ("altered value", "TXN-CONTENT1"),
+            )
+        elif corruption == "delete_with_updated_count":
+            connection.execute("DELETE FROM transactions WHERE transaction_id = ?", ("TXN-CONTENT2",))
+            connection.execute("UPDATE metadata SET value = '1' WHERE key = 'row_count'")
+        else:
+            connection.execute(
+                "UPDATE transactions SET transaction_id = ? WHERE transaction_id = ?",
+                ("TXN-REPLACED1", "TXN-CONTENT1"),
+            )
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        assert connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == int(
+            connection.execute("SELECT value FROM metadata WHERE key = 'row_count'").fetchone()[0]
+        )
+
+    assert not service._index_matches_source(investigator._sha256_file(dataset_path))
+
+
+def test_digest_distinguishes_null_empty_and_field_boundaries():
+    def digest_values(*values):
+        digest = hashlib.sha256()
+        for value in values:
+            investigator._update_digest_value(digest, value)
+        return digest.digest()
+
+    assert digest_values(None) != digest_values("")
+    assert digest_values("ab", "c") != digest_values("a", "bc")
+
+
+def test_valid_looking_altered_index_is_rebuilt_before_lookup(tmp_path):
+    dataset_path = tmp_path / "trusted.csv"
+    write_trusted_dataset(dataset_path, [raw_row("TXN-REPAIR01")])
+    service = InvestigatorReportService(dataset_path)
+    service.lookup_transaction("TXN-REPAIR01")
+
+    with sqlite3.connect(service._index_path) as connection:
+        connection.execute(
+            "UPDATE transactions SET vendor_location = ? WHERE transaction_id = ?",
+            ("tampered", "TXN-REPAIR01"),
+        )
+    stat = service._index_path.stat()
+    os.utime(service._index_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+
+    repaired = service.lookup_transaction("TXN-REPAIR01")
+    assert repaired.iloc[0]["vendor_location"] == "North"
+    assert service._index_matches_source(investigator._sha256_file(dataset_path))
+
+
+def test_failed_integrity_rebuild_does_not_serve_altered_index(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "trusted.csv"
+    write_trusted_dataset(dataset_path, [raw_row("TXN-NOREPAIR1")])
+    service = InvestigatorReportService(dataset_path)
+    service.lookup_transaction("TXN-NOREPAIR1")
+
+    with sqlite3.connect(service._index_path) as connection:
+        connection.execute(
+            "UPDATE transactions SET vendor_location = ? WHERE transaction_id = ?",
+            ("tampered", "TXN-NOREPAIR1"),
+        )
+    stat = service._index_path.stat()
+    os.utime(service._index_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+    monkeypatch.setattr(investigator.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("publish failed")))
+
+    with pytest.raises(investigator.TransactionSourceUnavailableError):
+        service.lookup_transaction("TXN-NOREPAIR1")
+    with sqlite3.connect(service._index_path) as connection:
+        assert connection.execute(
+            "SELECT vendor_location FROM transactions WHERE transaction_id = ?", ("TXN-NOREPAIR1",)
+        ).fetchone()[0] == "tampered"
+
+
+def test_source_change_invalidates_and_rebuilds_index(tmp_path):
+    dataset_path = tmp_path / "trusted.csv"
+    original = raw_row("TXN-CHANGE1")
+    write_trusted_dataset(dataset_path, [original])
+    service = InvestigatorReportService(dataset_path)
+    assert service.lookup_transaction("TXN-CHANGE1").iloc[0]["vendor_location"] == "North"
+
+    changed = dict(original, vendor_location="Updated location")
+    write_trusted_dataset(dataset_path, [changed])
+    stat = dataset_path.stat()
+    os.utime(dataset_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+    assert service.lookup_transaction("TXN-CHANGE1").iloc[0]["vendor_location"] == "Updated location"
+
+
+def test_failed_rebuild_never_serves_an_old_index(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "trusted.csv"
+    original = raw_row("TXN-STALE001")
+    write_trusted_dataset(dataset_path, [original])
+    service = InvestigatorReportService(dataset_path)
+    service.lookup_transaction("TXN-STALE001")
+    old_index = service._index_path.read_bytes()
+
+    write_trusted_dataset(dataset_path, [dict(original, vendor_location="New source value")])
+    stat = dataset_path.stat()
+    os.utime(dataset_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+    monkeypatch.setattr(investigator.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("publish failed")))
+
+    with pytest.raises(investigator.TransactionSourceUnavailableError):
+        service.lookup_transaction("TXN-STALE001")
+    assert service._index_path.read_bytes() == old_index
+
+
+def test_concurrent_index_initialization_and_lookup_are_serialized(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "trusted.csv"
+    write_trusted_dataset(dataset_path, [raw_row(f"TXN-THREAD{i:04d}") for i in range(12)])
+    original_build = InvestigatorReportService._build_index
+    build_count = 0
+    build_count_lock = threading.Lock()
+
+    def counted_build(self, *args, **kwargs):
+        nonlocal build_count
+        with build_count_lock:
+            build_count += 1
+        return original_build(self, *args, **kwargs)
+
+    monkeypatch.setattr(InvestigatorReportService, "_build_index", counted_build)
+    services = [InvestigatorReportService(dataset_path) for _ in range(8)]
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(
+            lambda pair: pair[0].lookup_transaction(f"TXN-THREAD{pair[1]:04d}").iloc[0]["transaction_id"],
+            [(service, index) for index, service in enumerate(services)],
+        ))
+
+    assert results == [f"TXN-THREAD{i:04d}" for i in range(8)]
+    assert build_count == 1
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        repeated = list(executor.map(
+            lambda index: services[index].lookup_transaction(f"TXN-THREAD{index:04d}").iloc[0]["transaction_id"],
+            range(8),
+        ))
+    assert repeated == results

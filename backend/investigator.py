@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import sqlite3
+import struct
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +37,9 @@ RAW_TRANSACTION_COLUMNS = (
 TRANSACTION_ID_PATTERN = re.compile(r"TXN-[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 REPORT_SCHEMA_VERSION = "1.0"
 CSV_CHUNK_SIZE = 25_000
+INDEX_SCHEMA_VERSION = "2"
+INDEX_BUILD_LOCK = threading.Lock()
+NUMERIC_RAW_COLUMNS = frozenset({"vendor_rating", "quantity", "unit_price", "total_amount"})
 
 
 class InvalidTransactionIdError(ValueError):
@@ -57,6 +66,63 @@ class PredictionMismatchError(RuntimeError):
     pass
 
 
+def _source_signature(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sqlite_value(value: Any) -> Any:
+    if pd.isna(value):
+        return None
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+def _update_digest_value(digest: Any, value: Any) -> None:
+    """Add one typed, length-delimited SQLite value to an index digest."""
+    if value is None:
+        digest.update(b"\x00")
+    elif isinstance(value, int):
+        digest.update(b"\x01" + struct.pack(">q", value))
+    elif isinstance(value, float):
+        digest.update(b"\x02" + struct.pack(">d", value))
+    elif isinstance(value, str):
+        encoded = value.encode("utf-8")
+        digest.update(b"\x03" + struct.pack(">Q", len(encoded)) + encoded)
+    elif isinstance(value, bytes):
+        digest.update(b"\x04" + struct.pack(">Q", len(value)) + value)
+    else:
+        raise TypeError(f"Unsupported SQLite value type: {type(value).__name__}")
+
+
+def _index_content_digest(connection: sqlite3.Connection) -> str:
+    """Hash all stored transaction fields in deterministic source-row order."""
+    digest = hashlib.sha256(b"ProcureMind SQLite transaction index content v1\0")
+    columns = ("_row_number", *RAW_TRANSACTION_COLUMNS)
+    for column in columns:
+        encoded = column.encode("utf-8")
+        digest.update(b"\x05" + struct.pack(">Q", len(encoded)) + encoded)
+
+    quoted_columns = ", ".join(f'"{column}"' for column in columns)
+    cursor = connection.execute(
+        f"SELECT {quoted_columns} FROM transactions ORDER BY _row_number"
+    )
+    while rows := cursor.fetchmany(10_000):
+        for row in rows:
+            for value in row:
+                _update_digest_value(digest, value)
+    return digest.hexdigest()
+
+
 def _decode_json(value: Any) -> Any | None:
     if not isinstance(value, str):
         return None
@@ -72,6 +138,9 @@ class InvestigatorReportService:
     def __init__(self, dataset_path: str | Path = TRANSACTION_DATASET):
         # dataset_path is an internal constructor seam for tests, never request input.
         self._dataset_path = Path(dataset_path)
+        self._index_path = self._dataset_path.parent / ".procuremind-cache" / f"{self._dataset_path.name}.sqlite3"
+        self._validated_signature: tuple[int, int, int, int] | None = None
+        self._validated_index_signature: tuple[int, int, int, int] | None = None
 
     @staticmethod
     def validate_transaction_id(transaction_id: Any) -> str:
@@ -81,26 +150,213 @@ class InvestigatorReportService:
 
     def lookup_transaction(self, transaction_id: str) -> pd.DataFrame:
         transaction_id = self.validate_transaction_id(transaction_id)
-        matches: list[pd.DataFrame] = []
         try:
-            for chunk in pd.read_csv(
-                self._dataset_path,
-                usecols=RAW_TRANSACTION_COLUMNS,
-                dtype={"transaction_id": "string"},
-                chunksize=CSV_CHUNK_SIZE,
-            ):
-                exact_rows = chunk.loc[chunk["transaction_id"] == transaction_id]
-                if not exact_rows.empty:
-                    matches.append(exact_rows)
-        except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+            self._ensure_index()
+            rows = self._query_index(transaction_id)
+        except (OSError, sqlite3.Error, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
             raise TransactionSourceUnavailableError("Trusted transaction data is unavailable.") from exc
-
-        match_count = sum(len(rows) for rows in matches)
-        if match_count == 0:
+        if not rows:
             raise TransactionNotFoundError("No exact transaction ID match was found.")
-        if match_count > 1:
+        if len(rows) > 1:
             raise AmbiguousTransactionError("The transaction ID has multiple exact matches.")
-        return matches[0].reset_index(drop=True).loc[:, RAW_TRANSACTION_COLUMNS]
+        result = pd.DataFrame(rows, columns=RAW_TRANSACTION_COLUMNS)
+        result["transaction_id"] = pd.array(result["transaction_id"], dtype="string")
+        for column in RAW_TRANSACTION_COLUMNS:
+            if column != "transaction_id":
+                result[column] = result[column].where(result[column].notna(), float("nan"))
+        return result.loc[:, RAW_TRANSACTION_COLUMNS]
+
+    def _ensure_index(self, *, force_rebuild: bool = False) -> None:
+        signature = _source_signature(self._dataset_path)
+        index_signature = self._current_index_signature()
+        if (
+            not force_rebuild
+            and signature == self._validated_signature
+            and index_signature == self._validated_index_signature
+        ):
+            return
+
+        # One process-wide lock prevents duplicate builds and keeps publication
+        # coordinated across service instances in this server process.
+        with INDEX_BUILD_LOCK:
+            signature = _source_signature(self._dataset_path)
+            index_signature = self._current_index_signature()
+            if (
+                not force_rebuild
+                and signature == self._validated_signature
+                and index_signature == self._validated_index_signature
+            ):
+                return
+            source_hash = _sha256_file(self._dataset_path)
+            if _source_signature(self._dataset_path) != signature:
+                raise OSError("Trusted transaction data changed while checking the index.")
+            if self._index_matches_source(source_hash):
+                self._validated_signature = signature
+                self._validated_index_signature = self._current_index_signature()
+                return
+            self._build_index(source_hash, signature)
+            self._validated_signature = signature
+            self._validated_index_signature = self._current_index_signature()
+
+    def _current_index_signature(self) -> tuple[int, int, int, int] | None:
+        try:
+            return _source_signature(self._index_path)
+        except OSError:
+            return None
+
+    def _index_matches_source(self, source_hash: str) -> bool:
+        if not self._index_path.is_file():
+            return False
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(f"file:{self._index_path}?mode=ro", uri=True)
+            integrity = connection.execute("PRAGMA quick_check").fetchone()
+            if integrity != ("ok",):
+                return False
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            if metadata.get("schema_version") != INDEX_SCHEMA_VERSION or metadata.get("source_sha256") != source_hash:
+                return False
+            stored_schema = [
+                (row[1], row[2].upper(), row[3], row[5])
+                for row in connection.execute("PRAGMA table_info(transactions)")
+            ]
+            expected_schema = [("_row_number", "INTEGER", 1, 0)] + [
+                (column, "REAL" if column in NUMERIC_RAW_COLUMNS else "TEXT", 0, 0)
+                for column in RAW_TRANSACTION_COLUMNS
+            ]
+            if stored_schema != expected_schema:
+                return False
+            row_count = connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+            duplicate_ids = connection.execute(
+                "SELECT COUNT(*) FROM (SELECT transaction_id FROM transactions "
+                "WHERE transaction_id IS NOT NULL GROUP BY transaction_id HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+            duplicate_rows = connection.execute(
+                "SELECT COALESCE(SUM(id_count - 1), 0) FROM "
+                "(SELECT COUNT(*) AS id_count FROM transactions WHERE transaction_id IS NOT NULL "
+                "GROUP BY transaction_id HAVING COUNT(*) > 1)"
+            ).fetchone()[0]
+            content_digest = _index_content_digest(connection)
+            return (
+                row_count == int(metadata["row_count"])
+                and duplicate_ids == int(metadata["duplicate_id_count"])
+                and duplicate_rows == int(metadata["duplicate_row_count"])
+                and content_digest == metadata.get("content_sha256")
+            )
+        except (OSError, sqlite3.Error, KeyError, ValueError, TypeError):
+            return False
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _build_index(self, source_hash: str, starting_signature: tuple[int, int, int, int]) -> None:
+        self._index_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{self._index_path.name}.", suffix=".tmp", dir=self._index_path.parent
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        connection: sqlite3.Connection | None = None
+        try:
+            column_definitions = [
+                f'"{column}" {"REAL" if column in NUMERIC_RAW_COLUMNS else "TEXT"}'
+                for column in RAW_TRANSACTION_COLUMNS
+            ]
+            insert_columns = ["_row_number", *RAW_TRANSACTION_COLUMNS]
+            placeholders = ", ".join("?" for _ in insert_columns)
+            quoted_columns = ", ".join(f'"{column}"' for column in insert_columns)
+            connection = sqlite3.connect(temporary_path)
+            with connection:
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                connection.execute(
+                    "CREATE TABLE transactions ("
+                    "_row_number INTEGER NOT NULL, " + ", ".join(column_definitions) + ")"
+                )
+                connection.execute(
+                    "CREATE INDEX transactions_by_id ON transactions (transaction_id COLLATE BINARY)"
+                )
+                row_count = 0
+                for chunk in pd.read_csv(
+                    self._dataset_path,
+                    usecols=RAW_TRANSACTION_COLUMNS,
+                    dtype={"transaction_id": "string"},
+                    chunksize=CSV_CHUNK_SIZE,
+                ):
+                    values = []
+                    for record in chunk.loc[:, RAW_TRANSACTION_COLUMNS].itertuples(index=False, name=None):
+                        row_count += 1
+                        values.append((row_count, *(_sqlite_value(value) for value in record)))
+                    connection.executemany(
+                        f"INSERT INTO transactions ({quoted_columns}) VALUES ({placeholders})", values
+                    )
+                indexed_rows = connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+                duplicate_ids = connection.execute(
+                    "SELECT COUNT(*) FROM (SELECT transaction_id FROM transactions "
+                    "WHERE transaction_id IS NOT NULL GROUP BY transaction_id HAVING COUNT(*) > 1)"
+                ).fetchone()[0]
+                duplicate_rows = connection.execute(
+                    "SELECT COALESCE(SUM(id_count - 1), 0) FROM "
+                    "(SELECT COUNT(*) AS id_count FROM transactions WHERE transaction_id IS NOT NULL "
+                    "GROUP BY transaction_id HAVING COUNT(*) > 1)"
+                ).fetchone()[0]
+                if indexed_rows != row_count:
+                    raise sqlite3.DatabaseError("Transaction index row count validation failed.")
+                content_digest = _index_content_digest(connection)
+                connection.executemany(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    [
+                        ("schema_version", INDEX_SCHEMA_VERSION),
+                        ("source_sha256", source_hash),
+                        ("row_count", str(row_count)),
+                        ("duplicate_id_count", str(duplicate_ids)),
+                        ("duplicate_row_count", str(duplicate_rows)),
+                        ("content_sha256", content_digest),
+                    ],
+                )
+                connection.commit()
+                if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    raise sqlite3.DatabaseError("Transaction index integrity validation failed.")
+            connection.close()
+            connection = None
+
+            # Dataset deployments must be immutable while a server process is
+            # running. Detect ordinary concurrent changes during build and refuse
+            # to publish an index from a moving source.
+            if _source_signature(self._dataset_path) != starting_signature or _sha256_file(self._dataset_path) != source_hash:
+                raise OSError("Trusted transaction data changed during index construction.")
+            os.replace(temporary_path, self._index_path)
+        finally:
+            if connection is not None:
+                connection.close()
+            temporary_path.unlink(missing_ok=True)
+
+    def _query_index(self, transaction_id: str) -> list[tuple[Any, ...]]:
+        select_columns = ", ".join(f'"{column}"' for column in RAW_TRANSACTION_COLUMNS)
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(f"file:{self._index_path}?mode=ro", uri=True)
+            return connection.execute(
+                f"SELECT {select_columns} FROM transactions "
+                "WHERE transaction_id = ? COLLATE BINARY ORDER BY _row_number LIMIT 2",
+                (transaction_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            # A corrupt or externally removed index is rebuilt from the trusted
+            # source. If rebuilding fails, do not query the previous index.
+            if connection is not None:
+                connection.close()
+                connection = None
+            self._ensure_index(force_rebuild=True)
+            connection = sqlite3.connect(f"file:{self._index_path}?mode=ro", uri=True)
+            return connection.execute(
+                f"SELECT {select_columns} FROM transactions "
+                "WHERE transaction_id = ? COLLATE BINARY ORDER BY _row_number LIMIT 2",
+                (transaction_id,),
+            ).fetchall()
+        finally:
+            if connection is not None:
+                connection.close()
 
     def generate_report(self, transaction_id: str) -> dict[str, Any]:
         transaction_id = self.validate_transaction_id(transaction_id)

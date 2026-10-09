@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from pathlib import Path
 
 import joblib
@@ -19,6 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "ml" / "model" / "shap_explanations.csv"
 ADDITIVITY_ATOL = 1e-6
 DEFAULT_BATCH_SIZE = 10
+SHAP_RANDOM_SEED = 42
+SHAP_RANDOM_LOCK = threading.Lock()
 
 
 def _explain_features(
@@ -41,27 +44,39 @@ def _explain_features(
         # SHAP passes arrays in the exact feature order established above.
         return -np.asarray(model.score_samples(pd.DataFrame(values, columns=expected_columns)), dtype=float)
 
-    masker = shap.maskers.Independent(background)
-    explainer = shap.Explainer(anomaly_score, masker, algorithm="permutation")
     feature_array = features.to_numpy(dtype=float)
     value_batches: list[np.ndarray] = []
     base_batches: list[np.ndarray] = []
     max_evals = 2 * len(expected_columns) + 1
-    for start in range(0, len(feature_array), batch_size):
-        result = explainer(feature_array[start : start + batch_size], max_evals=max_evals)
-        values = np.asarray(result.values, dtype=float)
-        bases = np.asarray(result.base_values, dtype=float).reshape(-1)
-        scores = anomaly_score(feature_array[start : start + batch_size])
-        if values.shape != (len(scores), len(expected_columns)):
-            raise ValueError(f"Unexpected SHAP values shape: {values.shape}.")
-        if bases.size == 1:
-            bases = np.repeat(bases, len(scores))
-        if bases.shape != scores.shape:
-            raise ValueError("SHAP baseline shape does not match the explained rows.")
-        if not np.allclose(bases + values.sum(axis=1), scores, rtol=1e-6, atol=ADDITIVITY_ATOL):
-            raise ValueError("Permutation SHAP values failed the anomaly-score additivity check.")
-        value_batches.append(values)
-        base_batches.append(bases)
+    # SHAP 0.52's supported seed parameter uses NumPy's process-global RNG.
+    # Serialize ProcureMind explanations and restore the caller's RNG state.
+    with SHAP_RANDOM_LOCK:
+        random_state = np.random.get_state()
+        try:
+            masker = shap.maskers.Independent(background)
+            explainer = shap.Explainer(
+                anomaly_score,
+                masker,
+                algorithm="permutation",
+                seed=SHAP_RANDOM_SEED,
+            )
+            for start in range(0, len(feature_array), batch_size):
+                result = explainer(feature_array[start : start + batch_size], max_evals=max_evals)
+                values = np.asarray(result.values, dtype=float)
+                bases = np.asarray(result.base_values, dtype=float).reshape(-1)
+                scores = anomaly_score(feature_array[start : start + batch_size])
+                if values.shape != (len(scores), len(expected_columns)):
+                    raise ValueError(f"Unexpected SHAP values shape: {values.shape}.")
+                if bases.size == 1:
+                    bases = np.repeat(bases, len(scores))
+                if bases.shape != scores.shape:
+                    raise ValueError("SHAP baseline shape does not match the explained rows.")
+                if not np.allclose(bases + values.sum(axis=1), scores, rtol=1e-6, atol=ADDITIVITY_ATOL):
+                    raise ValueError("Permutation SHAP values failed the anomaly-score additivity check.")
+                value_batches.append(values)
+                base_batches.append(bases)
+        finally:
+            np.random.set_state(random_state)
     if not value_batches:
         return np.empty((0, len(expected_columns))), np.empty((0,))
     return np.concatenate(value_batches), np.concatenate(base_batches)

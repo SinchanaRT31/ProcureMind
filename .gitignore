@@ -37,3 +37,6 @@ ml/model/feature_names.json
 
 # Human investigation records (runtime data)
 backend/data/investigations.json
+
+# Generated trusted-transaction lookup index
+.procuremind-cache/
