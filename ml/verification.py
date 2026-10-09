@@ -49,8 +49,19 @@ class ProcurementVerificationEngine(BaseEstimator):
         current = incoming[[TRANSACTION_ID_COLUMN, "invoice_date", *DUPLICATE_SIGNATURE]].copy()
         current["_incoming"] = True
         combined = pd.concat([reference, current], ignore_index=True).drop_duplicates(TRANSACTION_ID_COLUMN, keep="last")
-        duplicated = combined[combined.duplicated(DUPLICATE_SIGNATURE, keep=False)].sort_values([*DUPLICATE_SIGNATURE, "invoice_date", TRANSACTION_ID_COLUMN])
         candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Keep only complete signature groups containing a surviving incoming row.
+        # Building both indexes from the post-ID-deduplication frame preserves
+        # pandas' null equality for duplicated() and groupby(dropna=False).
+        incoming_signatures = combined.loc[combined["_incoming"], DUPLICATE_SIGNATURE].drop_duplicates()
+        if incoming_signatures.empty:
+            return candidates
+        incoming_signature_index = pd.MultiIndex.from_frame(incoming_signatures)
+        combined_signature_index = pd.MultiIndex.from_frame(combined[DUPLICATE_SIGNATURE])
+        relevant = combined.loc[combined_signature_index.isin(incoming_signature_index)]
+        duplicated = relevant[relevant.duplicated(DUPLICATE_SIGNATURE, keep=False)].sort_values(
+            [*DUPLICATE_SIGNATURE, "invoice_date", TRANSACTION_ID_COLUMN]
+        )
         # Only duplicated blocks are iterated; the full 200k set is never pairwise compared.
         for _, group in duplicated.groupby(DUPLICATE_SIGNATURE, dropna=False, sort=False):
             rows = group.reset_index(drop=True)
