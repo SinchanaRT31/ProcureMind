@@ -4,6 +4,15 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from backend.investigator import (
+    AmbiguousTransactionError,
+    InferenceUnavailableError,
+    InvestigatorReportService,
+    InvalidTransactionIdError,
+    PredictionMismatchError,
+    TransactionNotFoundError,
+    TransactionSourceUnavailableError,
+)
 from backend.reviews import (
     InvestigationStore,
     ReviewNotFoundError,
@@ -17,6 +26,7 @@ FRONTEND_DIR = ROOT_DIR / "frontend"
 DATA_FILE = ROOT_DIR / "backend" / "data" / "sample_data.json"
 INVESTIGATIONS_FILE = ROOT_DIR / "backend" / "data" / "investigations.json"
 REVIEW_STORE = InvestigationStore(DATA_FILE, INVESTIGATIONS_FILE)
+INVESTIGATOR = InvestigatorReportService()
 MAX_REQUEST_BYTES = 64 * 1024
 
 
@@ -85,6 +95,27 @@ class FrontendHandler(SimpleHTTPRequestHandler):
 
         if parsed.path == "/api/health":
             return self.send_json({"status": "ok"})
+
+        if parsed.path == "/api/investigations/report":
+            query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=False)
+            if set(query) != {"transaction_id"} or len(query["transaction_id"]) != 1:
+                return self.send_api_error(HTTPStatus.BAD_REQUEST, "Provide exactly one transaction_id parameter.")
+            transaction_id = query["transaction_id"][0]
+            try:
+                report = INVESTIGATOR.generate_report(transaction_id)
+            except InvalidTransactionIdError as exc:
+                return self.send_api_error(HTTPStatus.BAD_REQUEST, str(exc))
+            except TransactionNotFoundError as exc:
+                return self.send_api_error(HTTPStatus.NOT_FOUND, str(exc))
+            except AmbiguousTransactionError as exc:
+                return self.send_api_error(HTTPStatus.CONFLICT, str(exc))
+            except (TransactionSourceUnavailableError, InferenceUnavailableError):
+                return self.send_api_error(HTTPStatus.SERVICE_UNAVAILABLE, "Investigation report capability is unavailable.")
+            except PredictionMismatchError:
+                return self.send_api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Investigation report could not be generated.")
+            except Exception:
+                return self.send_api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Investigation report could not be generated.")
+            return self.send_json({"report": report})
 
         if parsed.path == "/api/cases":
             try:
