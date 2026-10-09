@@ -4,20 +4,25 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from backend.reviews import (
+    InvestigationStore,
+    ReviewNotFoundError,
+    ReviewStoreError,
+    ReviewValidationError,
+)
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = ROOT_DIR / "frontend"
 DATA_FILE = ROOT_DIR / "backend" / "data" / "sample_data.json"
+INVESTIGATIONS_FILE = ROOT_DIR / "backend" / "data" / "investigations.json"
+REVIEW_STORE = InvestigationStore(DATA_FILE, INVESTIGATIONS_FILE)
+MAX_REQUEST_BYTES = 64 * 1024
 
 
 def load_data() -> dict:
     with DATA_FILE.open("r", encoding="utf-8") as file:
         return json.load(file)
-
-
-def save_data(data: dict) -> None:
-    with DATA_FILE.open("w", encoding="utf-8") as file:
-        json.dump(data, file, indent=2)
 
 
 def filter_transactions(transactions: list[dict], query: dict) -> list[dict]:
@@ -66,7 +71,12 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/api/dashboard":
-            return self.send_json(build_dashboard_payload(load_data()))
+            try:
+                data = load_data()
+                data["cases"] = REVIEW_STORE.list_cases()
+                return self.send_json(build_dashboard_payload(data))
+            except (OSError, json.JSONDecodeError, ReviewStoreError):
+                return self.send_api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Dashboard data is unavailable.")
 
         if parsed.path == "/api/transactions":
             data = load_data()
@@ -76,6 +86,26 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/health":
             return self.send_json({"status": "ok"})
 
+        if parsed.path == "/api/cases":
+            try:
+                return self.send_json({"cases": REVIEW_STORE.list_cases()})
+            except ReviewStoreError:
+                return self.send_api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Investigation records are unavailable.")
+
+        if parsed.path.startswith("/api/cases/"):
+            case_id, is_history = self.case_route(parsed.path)
+            if case_id is None:
+                return self.send_api_error(HTTPStatus.NOT_FOUND, "Case endpoint not found.")
+            try:
+                case = REVIEW_STORE.get_case(case_id)
+            except ReviewNotFoundError as exc:
+                return self.send_api_error(HTTPStatus.NOT_FOUND, str(exc))
+            except ReviewStoreError:
+                return self.send_api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Investigation records are unavailable.")
+            if is_history:
+                return self.send_json({"case_id": case_id, "review_history": case["review_history"]})
+            return self.send_json({"case": case})
+
         if parsed.path in {"", "/"}:
             self.path = "/index.html"
         else:
@@ -84,46 +114,92 @@ class FrontendHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if not parsed.path.startswith("/api/cases/"):
-            self.send_error(HTTPStatus.NOT_FOUND, "Endpoint not found")
-            return
+        if parsed.path == "/api/cases":
+            body = self.read_json_body()
+            if body is None:
+                return self.send_api_error(HTTPStatus.BAD_REQUEST, "Malformed JSON request body.")
+            try:
+                case, created = REVIEW_STORE.open_case(body.get("transaction_id"), body.get("reviewer_id"))
+            except ReviewValidationError as exc:
+                return self.send_api_error(HTTPStatus.BAD_REQUEST, str(exc))
+            except ReviewNotFoundError as exc:
+                return self.send_api_error(HTTPStatus.NOT_FOUND, str(exc))
+            except ReviewStoreError:
+                return self.send_api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Could not save investigation record.")
+            return self.send_json({"case": case}, HTTPStatus.CREATED if created else HTTPStatus.OK)
 
-        case_id = parsed.path.removeprefix("/api/cases/")
+        if not parsed.path.startswith("/api/cases/"):
+            return self.send_api_error(HTTPStatus.NOT_FOUND, "Endpoint not found.")
+
+        case_id, is_history = self.case_route(parsed.path)
+        if case_id is None or is_history:
+            return self.send_api_error(HTTPStatus.NOT_FOUND, "Case endpoint not found.")
         body = self.read_json_body()
         if body is None:
-            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON body")
-            return
+            return self.send_api_error(HTTPStatus.BAD_REQUEST, "Malformed JSON request body.")
+        try:
+            case = REVIEW_STORE.update_case(case_id, body)
+        except ReviewValidationError as exc:
+            return self.send_api_error(HTTPStatus.BAD_REQUEST, str(exc))
+        except ReviewNotFoundError as exc:
+            return self.send_api_error(HTTPStatus.NOT_FOUND, str(exc))
+        except ReviewStoreError:
+            return self.send_api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Could not save investigation changes.")
+        return self.send_json({"case": case})
 
-        data = load_data()
-        for case in data["cases"]:
-            if case["id"] != case_id:
-                continue
-            case["status"] = body.get("status", case["status"])
-            case["notes"] = body.get("notes", case["notes"])
-            save_data(data)
-            return self.send_json({"case": case})
+    def do_PATCH(self):
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/cases/"):
+            return self.send_api_error(HTTPStatus.NOT_FOUND, "Endpoint not found.")
+        case_id, is_history = self.case_route(parsed.path)
+        if case_id is None or is_history:
+            return self.send_api_error(HTTPStatus.NOT_FOUND, "Case endpoint not found.")
+        body = self.read_json_body()
+        if body is None:
+            return self.send_api_error(HTTPStatus.BAD_REQUEST, "Malformed JSON request body.")
+        try:
+            case = REVIEW_STORE.update_case(case_id, body)
+        except ReviewValidationError as exc:
+            return self.send_api_error(HTTPStatus.BAD_REQUEST, str(exc))
+        except ReviewNotFoundError as exc:
+            return self.send_api_error(HTTPStatus.NOT_FOUND, str(exc))
+        except ReviewStoreError:
+            return self.send_api_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Could not save investigation changes.")
+        return self.send_json({"case": case})
 
-        self.send_error(HTTPStatus.NOT_FOUND, "Case not found")
+    @staticmethod
+    def case_route(path: str) -> tuple[str | None, bool]:
+        parts = path.removeprefix("/api/cases/").split("/")
+        if len(parts) == 1 and parts[0]:
+            return parts[0], False
+        if len(parts) == 2 and parts[0] and parts[1] == "history":
+            return parts[0], True
+        return None, False
 
     def read_json_body(self) -> dict | None:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return None
-
+        if content_length <= 0 or content_length > MAX_REQUEST_BYTES:
+            return None
         raw = self.rfile.read(content_length)
         try:
-            return json.loads(raw.decode("utf-8"))
+            payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
+        return payload if isinstance(payload, dict) else None
 
-    def send_json(self, payload: dict) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(HTTPStatus.OK)
+    def send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_api_error(self, status: HTTPStatus, message: str) -> None:
+        self.send_json({"error": message}, status)
 
 
 def run() -> None:

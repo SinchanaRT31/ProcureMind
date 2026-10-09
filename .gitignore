@@ -34,3 +34,6 @@ ml/model/split_metadata.json
 ml/model/temporal_cadence_experiment.json
 ml/model/verification_evaluation.json
 ml/model/feature_names.json
+
+# Human investigation records (runtime data)
+backend/data/investigations.json

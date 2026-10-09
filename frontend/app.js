@@ -13,6 +13,12 @@ function el(id) {
   return document.getElementById(id);
 }
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[character]);
+}
+
 function formatAmount(amount) {
   return currencyFormatter.format(amount);
 }
@@ -24,7 +30,14 @@ function riskClass(level) {
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, options);
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+    let message = `Request failed (${response.status}).`;
+    try {
+      const payload = await response.json();
+      if (payload.error) message = payload.error;
+    } catch (_) {
+      // Keep the HTTP status message when a response has no JSON body.
+    }
+    throw new Error(message);
   }
   return response.json();
 }
@@ -85,6 +98,7 @@ function renderTransactions(transactions) {
           <td>${formatAmount(item.amount)}</td>
           <td><span class="badge ${item.level}">${item.risk}/100</span></td>
           <td>${item.status}</td>
+          <td><button class="button secondary open-investigation" data-transaction-id="${escapeHtml(item.id)}" type="button">Open case</button></td>
         </tr>
       `,
     )
@@ -159,27 +173,55 @@ function renderDuplicates(duplicates) {
 }
 
 function caseCard(caseItem) {
+  const transaction = state.dashboard?.transactions.find((item) => item.id === caseItem.transaction_id);
+  const events = (caseItem.review_history || []).map((event) => `
+    <li class="review-event">
+      <strong>${escapeHtml(event.event_type.replaceAll("_", " "))}</strong>
+      <span class="helper">${escapeHtml(event.timestamp)}${event.reviewer_id ? ` · ${escapeHtml(event.reviewer_id)}` : ""}</span>
+      <div>${escapeHtml(JSON.stringify(event.changes || {}))}</div>
+    </li>
+  `).join("");
+  const decisions = ["", "CONFIRMED_ISSUE", "NO_ISSUE_FOUND", "NEEDS_MORE_INFORMATION", "ESCALATED"];
+  const decisionOptions = decisions.map((decision) => `<option value="${decision}" ${decision === (caseItem.investigation_decision || "") ? "selected" : ""}>${decision || "No decision recorded"}</option>`).join("");
   return `
-    <article class="stack-item" data-case-id="${caseItem.id}">
+    <article class="stack-item case-card" data-case-id="${escapeHtml(caseItem.id)}">
       <div class="stack-item-head">
-        <strong>Case #${caseItem.id}</strong>
-        <span class="badge ${riskClass(caseItem.priority)}">${caseItem.priority}</span>
+        <strong>Case #${escapeHtml(caseItem.id)}</strong>
+        <span class="badge ${riskClass(caseItem.priority || "low")}">${escapeHtml(caseItem.priority || "No priority")}</span>
       </div>
       <div class="stack-item-meta">
-        <span>Owner: ${caseItem.owner}</span>
-        <span>Transaction: ${caseItem.transaction_id}</span>
+        <span>${caseItem.owner ? `Owner: ${escapeHtml(caseItem.owner)} (sample)` : "Reviewer identity is optional"}</span>
+        <span>Transaction: ${escapeHtml(caseItem.transaction_id)}</span>
       </div>
+      ${transaction ? `<div class="review-transaction"><strong>${escapeHtml(transaction.invoice)} · ${escapeHtml(transaction.vendor)}</strong><div class="stack-item-meta"><span>${escapeHtml(transaction.department)}</span><span>${escapeHtml(transaction.date)}</span><span>${formatAmount(transaction.amount)}</span><span>Sample risk: ${escapeHtml(transaction.risk)}/100 (${escapeHtml(transaction.level)})</span></div><p>${escapeHtml(transaction.reason)}</p><p class="helper">${escapeHtml(transaction.explanation?.summary || "")}</p></div>` : ""}
       <div class="case-actions">
-        <div class="case-status-row">
-          <select class="case-status">
-            <option ${caseItem.status === "Under Investigation" ? "selected" : ""}>Under Investigation</option>
-            <option ${caseItem.status === "Confirmed" ? "selected" : ""}>Confirmed</option>
-            <option ${caseItem.status === "False Positive" ? "selected" : ""}>False Positive</option>
-            <option ${caseItem.status === "Review Pending" ? "selected" : ""}>Review Pending</option>
-          </select>
-          <button class="button primary save-case" type="button">Save</button>
-        </div>
-        <textarea class="case-notes" rows="3">${caseItem.notes}</textarea>
+        <div class="review-controls">
+          <label>Review status
+            <select class="case-review-status">
+              ${["OPEN", "REVIEWING", "RESOLVED"].map((status) => `<option ${caseItem.review_status === status ? "selected" : ""}>${status}</option>`).join("")}
+            </select>
+          </label>
+          <label>Investigation decision
+            <select class="case-decision">${decisionOptions}</select>
+            <span class="helper">A recorded reviewer decision, not an automatic fraud finding.</span>
+          </label>
+          <label>Reviewer identifier (optional)
+            <input class="case-reviewer" type="text" maxlength="200" value="${escapeHtml(caseItem.reviewer_id || "")}" placeholder="Not authenticated" />
+          </label>
+          <label>Existing investigation notes
+            <div class="existing-notes">${escapeHtml(caseItem.investigation_notes || "No notes recorded.")}</div>
+          </label>
+          <label>Add a note
+            <textarea class="case-note" rows="3" maxlength="10000" placeholder="Add an investigation note"></textarea>
+          </label>
+          <div class="case-status-row">
+            <button class="button primary save-case" type="button">Save review</button>
+            <span class="case-save-message" role="status"></span>
+          </div>
+          <details class="review-history">
+            <summary>Review history (${(caseItem.review_history || []).length})</summary>
+            <ol>${events || "<li>No review events yet.</li>"}</ol>
+          </details>
       </div>
     </article>
   `;
@@ -224,31 +266,61 @@ async function saveCase(event) {
 
   const card = button.closest("[data-case-id]");
   const caseId = card.dataset.caseId;
-  const status = card.querySelector(".case-status").value;
-  const notes = card.querySelector(".case-notes").value;
+  const reviewStatus = card.querySelector(".case-review-status").value;
+  const decision = card.querySelector(".case-decision").value;
+  const reviewerId = card.querySelector(".case-reviewer").value;
+  const note = card.querySelector(".case-note").value;
+  const message = card.querySelector(".case-save-message");
 
   button.disabled = true;
   button.textContent = "Saving...";
 
   try {
-    await fetchJson(`/api/cases/${caseId}`, {
+    await fetchJson(`/api/cases/${encodeURIComponent(caseId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ review_status: reviewStatus, investigation_decision: decision || null, reviewer_id: reviewerId, ...(note.trim() ? { note } : {}) }),
+    });
+    message.textContent = "Saved.";
+    button.textContent = "Saved";
+    setTimeout(() => loadDashboard().catch(() => {
+      message.textContent = "Saved, but the refreshed dashboard could not be loaded.";
+      button.disabled = false;
+      button.textContent = "Save review";
+    }), 700);
+  } catch (error) {
+    message.textContent = error.message;
+    button.disabled = false;
+    button.textContent = "Save review";
+  }
+}
+
+async function openInvestigation(event) {
+  const button = event.target.closest(".open-investigation");
+  if (!button) return;
+  button.disabled = true;
+  const originalText = button.textContent;
+  button.textContent = "Opening...";
+  try {
+    await fetchJson("/api/cases", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status, notes }),
+      body: JSON.stringify({ transaction_id: button.dataset.transactionId }),
     });
-    button.textContent = "Saved";
-    setTimeout(() => {
-      button.disabled = false;
-      button.textContent = "Save";
-    }, 900);
+    await loadDashboard();
+    el("cases-panel").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
+    button.textContent = error.message;
     button.disabled = false;
-    button.textContent = "Retry";
+    return;
   }
+  button.textContent = originalText;
+  button.disabled = false;
 }
 
 document.getElementById("filters-form").addEventListener("submit", applyFilters);
 document.getElementById("cases-list").addEventListener("click", saveCase);
+document.getElementById("transactions-body").addEventListener("click", openInvestigation);
 
 loadDashboard().catch(() => {
   el("topbar-alert").textContent = "Unable to load dashboard data.";

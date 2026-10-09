@@ -72,4 +72,24 @@ python -m pytest
 python backend/main.py
 ```
 
-Open `http://127.0.0.1:8000`. The existing dashboard and case workflow are unchanged.
+Open `http://127.0.0.1:8000`. The dashboard continues to use sample transaction and evidence data; it is not connected to live ML predictions.
+
+## Human review workflow
+
+Review cases can be opened from a dashboard transaction or through the API. Review status is separate from any decision: statuses are `OPEN`, `REVIEWING`, and `RESOLVED`; decisions are `CONFIRMED_ISSUE`, `NO_ISSUE_FOUND`, `NEEDS_MORE_INFORMATION`, or `ESCALATED`. `CONFIRMED_ISSUE` is a reviewer-entered investigation outcome, not an automatic fraud finding. Reviewer identifiers are optional text; the application has no authentication or authorization.
+
+Cases and review history are persisted in the ignored runtime file `backend/data/investigations.json`, separate from `sample_data.json` and all generated ML artifacts. The first API read or write idempotently seeds existing sample cases into the review store. Later starts fill in any newly added sample cases by ID while preserving saved review status, decisions, notes, and history. Updates are serialized within the server process and written using a temporary file plus atomic replacement. The sample JSON remains unchanged by case reviews.
+
+The dashboard supports opening a case, changing its review status, recording or updating a decision, adding notes, and viewing event history. Existing dashboard case fields (`id`, `transaction_id`, `status`, and `notes`, among others) remain in API responses for compatibility. Legacy `POST /api/cases/{case_id}` accepts existing status labels and the `notes` field; submitted notes are appended to preserve history.
+
+API routes:
+
+- `GET /api/cases` — list cases.
+- `GET /api/cases/{case_id}` — retrieve a case and its history.
+- `GET /api/cases/{case_id}/history` — retrieve review events.
+- `POST /api/cases` with `{"transaction_id": "tx-2048"}` — open a case; returns an existing active case for that transaction when present.
+- `PATCH /api/cases/{case_id}` — update `review_status`, `investigation_decision`, optional `reviewer_id`, and/or append a `note`.
+- `POST /api/cases/{case_id}` — compatible legacy update route; also accepts the validated review fields.
+- `GET /api/dashboard`, `GET /api/transactions`, and `GET /api/health` remain available.
+
+Human review is separate from anomaly detection, SHAP model explanations, behavioral evidence, and document verification. The UI shows sample transaction context and does not claim those fields are live ML outputs. Review history is application-level history, not a tamper-proof audit log. The process lock does not coordinate multiple server processes or hosts; this local JSON store is not intended as a production multi-instance database.
